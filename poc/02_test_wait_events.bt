@@ -1,0 +1,115 @@
+#!/usr/bin/env bpftrace
+/*
+ * 02_test_wait_events.bt
+ *
+ * Test wait event tracing with exact timing.
+ * This captures when PostgreSQL enters and exits wait states.
+ *
+ * Usage:
+ *   sudo bpftrace 02_test_wait_events.bt -p <backend_pid>
+ *
+ * Wait Event Classes (bits 24-31 of wait_event_info):
+ *   0x01 = LWLock
+ *   0x03 = Lock (heavyweight)
+ *   0x04 = BufferPin
+ *   0x05 = Activity
+ *   0x06 = Client
+ *   0x07 = Extension
+ *   0x08 = IPC
+ *   0x09 = Timeout
+ *   0x0A = IO
+ */
+
+BEGIN
+{
+    printf("=== PostgreSQL Wait Event Tracer ===\n");
+    printf("Tracing wait events with timing...\n\n");
+
+    /* Wait class names */
+    @class[0x01] = "LWLock";
+    @class[0x03] = "Lock";
+    @class[0x04] = "BufferPin";
+    @class[0x05] = "Activity";
+    @class[0x06] = "Client";
+    @class[0x07] = "Extension";
+    @class[0x08] = "IPC";
+    @class[0x09] = "Timeout";
+    @class[0x0A] = "IO";
+}
+
+/* WaitEventSetWait - main wait dispatcher */
+/* int WaitEventSetWait(WaitEventSet *set, long timeout, WaitEvent *occurred_events,
+ *                      int nevents, uint32 wait_event_info) */
+uprobe:/usr/lib/postgresql/13/bin/postgres:WaitEventSetWait
+{
+    @wait_start[tid] = nsecs;
+    @wait_event[tid] = arg4;  /* wait_event_info is 5th parameter */
+}
+
+uretprobe:/usr/lib/postgresql/13/bin/postgres:WaitEventSetWait
+/@wait_start[tid]/
+{
+    $ela_us = (nsecs - @wait_start[tid]) / 1000;
+    $event = @wait_event[tid];
+    $class = ($event >> 24) & 0xFF;
+    $id = $event & 0xFFFFFF;
+
+    printf("[%d] WAIT class=0x%02x (%s) id=0x%06x ela=%lu us\n",
+           tid, $class, @class[$class], $id, $ela_us);
+
+    @wait_time_by_class[$class] = sum($ela_us);
+    @wait_count_by_class[$class] = count();
+
+    delete(@wait_start[tid]);
+    delete(@wait_event[tid]);
+}
+
+/* LWLock acquisition */
+uprobe:/usr/lib/postgresql/13/bin/postgres:LWLockAcquire
+{
+    @lwlock_start[tid] = nsecs;
+}
+
+uretprobe:/usr/lib/postgresql/13/bin/postgres:LWLockAcquire
+/@lwlock_start[tid]/
+{
+    $ela_us = (nsecs - @lwlock_start[tid]) / 1000;
+    @lwlock_time = sum($ela_us);
+    @lwlock_count = count();
+    delete(@lwlock_start[tid]);
+}
+
+/* Regular Lock acquisition */
+uprobe:/usr/lib/postgresql/13/bin/postgres:LockAcquireExtended
+{
+    @lock_start[tid] = nsecs;
+}
+
+uretprobe:/usr/lib/postgresql/13/bin/postgres:LockAcquireExtended
+/@lock_start[tid]/
+{
+    $ela_us = (nsecs - @lock_start[tid]) / 1000;
+    @lock_time = sum($ela_us);
+    @lock_count = count();
+    delete(@lock_start[tid]);
+}
+
+END
+{
+    printf("\n=== Wait Event Summary ===\n");
+
+    printf("\nWait time by class (us):\n");
+    print(@wait_time_by_class);
+
+    printf("\nWait count by class:\n");
+    print(@wait_count_by_class);
+
+    printf("\nLWLock: %lld us total, %lld calls\n", @lwlock_time, @lwlock_count);
+    printf("Lock: %lld us total, %lld calls\n", @lock_time, @lock_count);
+
+    clear(@class);
+    clear(@wait_start);
+    clear(@wait_event);
+    clear(@lwlock_start);
+    clear(@lock_start);
+}

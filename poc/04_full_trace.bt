@@ -1,0 +1,128 @@
+#!/usr/bin/env bpftrace
+/*
+ * 04_full_trace.bt
+ *
+ * Combined tracer for Oracle 10046-style output.
+ * Captures nodes, waits, and IO in a unified trace.
+ *
+ * Usage:
+ *   sudo bpftrace 04_full_trace.bt -p <backend_pid>
+ *
+ * This produces output similar to Oracle 10046 trace format.
+ */
+
+BEGIN
+{
+    printf("*** PG_10046 TRACE ***\n");
+    printf("*** PID: target ***\n");
+    printf("*** %s ***\n", strftime("%Y-%m-%d %H:%M:%S", nsecs));
+    printf("======================\n\n");
+
+    @cursor_id = 0;
+}
+
+/* Query start - capture SQL text */
+uprobe:/usr/lib/postgresql/13/bin/postgres:standard_ExecutorRun
+{
+    $qd = (uint64)arg0;
+    /* QueryDesc->sourceText is at offset 0x10 (16) for PG13 */
+    $sql_ptr = *(uint64*)($qd + 0x10);
+
+    @cursor_id = @cursor_id + 1;
+    @exec_start[tid] = nsecs;
+
+    printf("PARSING IN CURSOR #%lld tim=%lu\n", @cursor_id, nsecs / 1000);
+    printf("%s\n", str($sql_ptr, 200));
+    printf("END OF STMT\n\n");
+}
+
+/* Node execution tracking */
+uprobe:/usr/lib/postgresql/13/bin/postgres:InstrStartNode
+{
+    @node_start[tid] = nsecs;
+    @node_id[tid] = @node_id[tid] + 1;
+
+    printf("NODE_START #%lld id=%lld tim=%lu\n",
+           @cursor_id, @node_id[tid], nsecs / 1000);
+}
+
+uprobe:/usr/lib/postgresql/13/bin/postgres:InstrStopNode
+{
+    $ela_us = (nsecs - @node_start[tid]) / 1000;
+
+    printf("NODE_STOP  #%lld id=%lld ela=%lu us\n",
+           @cursor_id, @node_id[tid], $ela_us);
+
+    @node_id[tid] = @node_id[tid] - 1;
+    delete(@node_start[tid]);
+}
+
+/* Wait events */
+uprobe:/usr/lib/postgresql/13/bin/postgres:WaitEventSetWait
+{
+    @wait_start[tid] = nsecs;
+    @wait_event[tid] = arg4;
+}
+
+uretprobe:/usr/lib/postgresql/13/bin/postgres:WaitEventSetWait
+/@wait_start[tid]/
+{
+    $ela_us = (nsecs - @wait_start[tid]) / 1000;
+    $event = @wait_event[tid];
+    $class = ($event >> 24) & 0xFF;
+
+    /* Only print significant waits (> 100us) */
+    if ($ela_us > 100) {
+        printf("WAIT #%lld class=0x%02x event=0x%06x ela=%lu us\n",
+               @cursor_id, $class, $event & 0xFFFFFF, $ela_us);
+    }
+
+    delete(@wait_start[tid]);
+    delete(@wait_event[tid]);
+}
+
+/* IO operations */
+uprobe:/usr/lib/postgresql/13/bin/postgres:mdread
+{
+    @io_start[tid] = nsecs;
+    $smgr = (uint64)arg0;
+    @io_rel[tid] = *(uint32*)($smgr + 8);
+    @io_blk[tid] = arg2;
+}
+
+uretprobe:/usr/lib/postgresql/13/bin/postgres:mdread
+/@io_start[tid]/
+{
+    $ela_us = (nsecs - @io_start[tid]) / 1000;
+
+    printf("IO #%lld rel=%u blk=%u ela=%lu us\n",
+           @cursor_id, @io_rel[tid], @io_blk[tid], $ela_us);
+
+    delete(@io_start[tid]);
+    delete(@io_rel[tid]);
+    delete(@io_blk[tid]);
+}
+
+/* Query end */
+uretprobe:/usr/lib/postgresql/13/bin/postgres:standard_ExecutorRun
+/@exec_start[tid]/
+{
+    $ela_us = (nsecs - @exec_start[tid]) / 1000;
+
+    printf("\nEXEC #%lld e=%lu us\n\n", @cursor_id, $ela_us);
+
+    delete(@exec_start[tid]);
+}
+
+END
+{
+    printf("\n*** END TRACE ***\n");
+    clear(@node_start);
+    clear(@node_id);
+    clear(@wait_start);
+    clear(@wait_event);
+    clear(@io_start);
+    clear(@io_rel);
+    clear(@io_blk);
+    clear(@exec_start);
+}

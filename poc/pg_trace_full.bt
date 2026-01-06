@@ -1,0 +1,141 @@
+#!/usr/bin/env bpftrace
+/*
+ * pg_trace_full.bt - Full tracer with proper node identification
+ *
+ * Node identification strategy:
+ * - Assign unique ID to each node on first start
+ * - Track node stack for parent-child relationships
+ * - Attribute IO/waits to current (innermost) node
+ */
+
+BEGIN {
+    printf("# PG_10046 TRACE - %s\n", strftime("%Y-%m-%d %H:%M:%S", nsecs));
+    printf("# FORMAT: TIM,EVENT,NODE_ID,PARENT_ID,DETAIL\n");
+    @next_node_id = 1;
+}
+
+/* Query start */
+uprobe:/usr/pgsql-13/bin/postgres:standard_ExecutorRun {
+    @query_id[tid]++;
+    @query_start[tid] = nsecs;
+
+    /* Read SQL text */
+    $qd = arg0;
+    $sql = *(uint64*)($qd + 16);
+
+    printf("%lu,QUERY_START,%d,0,qid=%d sql=%.80s\n",
+           nsecs/1000, 0, @query_id[tid], str($sql));
+}
+
+/* Node start - assign unique ID, track stack */
+uprobe:/usr/pgsql-13/bin/postgres:InstrStartNode {
+    $instr = arg0;
+
+    /* Get or assign node ID based on Instrumentation pointer */
+    $existing_id = @node_ids[$instr];
+    if ($existing_id == 0) {
+        $existing_id = @next_node_id;
+        @node_ids[$instr] = $existing_id;
+        @next_node_id++;
+    }
+
+    /* Push to stack */
+    @depth[tid]++;
+    $d = @depth[tid];
+    @node_stack[tid, $d] = $existing_id;
+    @node_start[tid] = nsecs;
+
+    /* Parent is one level up in stack */
+    $parent = @node_stack[tid, $d - 1];
+
+    printf("%lu,NODE_START,%d,%d,depth=%d\n",
+           nsecs/1000, $existing_id, $parent, $d);
+}
+
+/* Node stop */
+uprobe:/usr/pgsql-13/bin/postgres:InstrStopNode {
+    $d = @depth[tid];
+    $node_id = @node_stack[tid, $d];
+    $parent = @node_stack[tid, $d - 1];
+    $ela = (nsecs - @node_start[tid]) / 1000;
+
+    printf("%lu,NODE_STOP,%d,%d,ela=%lu depth=%d\n",
+           nsecs/1000, $node_id, $parent, $ela, $d);
+
+    /* Pop from stack */
+    @node_stack[tid, $d] = 0;
+    @depth[tid]--;
+}
+
+/* IO - attribute to current node */
+uprobe:/usr/pgsql-13/bin/postgres:mdread {
+    @io_start[tid] = nsecs;
+    @io_rel[tid] = *(uint32*)(arg0 + 8);
+    @io_blk[tid] = arg2;
+
+    /* Current node is top of stack */
+    $d = @depth[tid];
+    @io_node[tid] = @node_stack[tid, $d];
+}
+
+uretprobe:/usr/pgsql-13/bin/postgres:mdread /@io_start[tid]/ {
+    $ela = (nsecs - @io_start[tid]) / 1000;
+    $node = @io_node[tid];
+
+    printf("%lu,IO,%d,0,rel=%u blk=%u ela=%lu\n",
+           nsecs/1000, $node, @io_rel[tid], @io_blk[tid], $ela);
+
+    /* Accumulate IO stats per node */
+    @node_io_count[$node]++;
+    @node_io_time[$node] = @node_io_time[$node] + $ela;
+
+    delete(@io_start[tid]); delete(@io_rel[tid]);
+    delete(@io_blk[tid]); delete(@io_node[tid]);
+}
+
+/* Wait events - attribute to current node */
+uprobe:/usr/pgsql-13/bin/postgres:WaitEventSetWait {
+    @wait_start[tid] = nsecs;
+    @wait_event[tid] = arg4;
+
+    $d = @depth[tid];
+    @wait_node[tid] = @node_stack[tid, $d];
+}
+
+uretprobe:/usr/pgsql-13/bin/postgres:WaitEventSetWait /@wait_start[tid]/ {
+    $ela = (nsecs - @wait_start[tid]) / 1000;
+    if ($ela > 100) {  /* Filter noise */
+        $node = @wait_node[tid];
+        $class = (@wait_event[tid] >> 24) & 0xff;
+
+        printf("%lu,WAIT,%d,0,class=0x%02x ela=%lu\n",
+               nsecs/1000, $node, $class, $ela);
+
+        /* Accumulate wait stats per node */
+        @node_wait_count[$node]++;
+        @node_wait_time[$node] = @node_wait_time[$node] + $ela;
+    }
+    delete(@wait_start[tid]); delete(@wait_event[tid]); delete(@wait_node[tid]);
+}
+
+/* Query end */
+uretprobe:/usr/pgsql-13/bin/postgres:standard_ExecutorRun /@query_start[tid]/ {
+    $ela = (nsecs - @query_start[tid]) / 1000;
+    printf("%lu,QUERY_END,%d,0,ela=%lu\n", nsecs/1000, 0, $ela);
+    delete(@query_start[tid]);
+}
+
+END {
+    printf("\n# === NODE SUMMARY ===\n");
+    printf("# IO count by node:\n");
+    print(@node_io_count);
+    printf("# IO time by node (us):\n");
+    print(@node_io_time);
+    printf("# Wait count by node:\n");
+    print(@node_wait_count);
+    printf("# Wait time by node (us):\n");
+    print(@node_wait_time);
+
+    clear(@depth); clear(@node_stack); clear(@node_start);
+    clear(@node_ids); clear(@query_id); clear(@query_start);
+}

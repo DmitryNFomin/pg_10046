@@ -1,0 +1,135 @@
+#!/usr/bin/env bpftrace
+/*
+ * 03_test_io_tracing.bt
+ *
+ * Test IO tracing with file/block information.
+ * Captures PostgreSQL storage manager reads with RelFileNode details.
+ *
+ * Usage:
+ *   sudo bpftrace 03_test_io_tracing.bt -p <backend_pid>
+ *
+ * SMgrRelation struct contains:
+ *   - smgr_rnode.node.spcNode (tablespace OID)
+ *   - smgr_rnode.node.dbNode  (database OID)
+ *   - smgr_rnode.node.relNode (relation OID)
+ *
+ * This traces:
+ *   - mdread: actual block reads from disk
+ *   - mdwrite: block writes to disk
+ *   - ReadBufferExtended: buffer manager requests
+ */
+
+/* RelFileNode offsets within SMgrRelationData */
+/* SMgrRelationData.smgr_rnode is at offset 0 */
+/* RelFileNodeBackend.node is at offset 0 */
+/* RelFileNode: spcNode(4), dbNode(4), relNode(4) */
+
+BEGIN
+{
+    printf("=== PostgreSQL IO Tracer ===\n");
+    printf("Tracing mdread/mdwrite with file info...\n\n");
+}
+
+/* mdread - reads one block from disk */
+/* void mdread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, char *buffer) */
+uprobe:/usr/lib/postgresql/13/bin/postgres:mdread
+{
+    @io_start[tid] = nsecs;
+
+    $smgr = (uint64)arg0;
+    /* RelFileNode is at the start of SMgrRelationData */
+    @io_spc[tid] = *(uint32*)($smgr + 0);      /* spcNode */
+    @io_db[tid] = *(uint32*)($smgr + 4);       /* dbNode */
+    @io_rel[tid] = *(uint32*)($smgr + 8);      /* relNode */
+    @io_fork[tid] = arg1;                       /* ForkNumber */
+    @io_blk[tid] = arg2;                        /* BlockNumber */
+}
+
+uretprobe:/usr/lib/postgresql/13/bin/postgres:mdread
+/@io_start[tid]/
+{
+    $ela_us = (nsecs - @io_start[tid]) / 1000;
+
+    printf("[%d] READ spc=%u db=%u rel=%u fork=%d blk=%u ela=%lu us\n",
+           tid,
+           @io_spc[tid],
+           @io_db[tid],
+           @io_rel[tid],
+           @io_fork[tid],
+           @io_blk[tid],
+           $ela_us);
+
+    @read_time_by_rel[@io_rel[tid]] = sum($ela_us);
+    @read_count_by_rel[@io_rel[tid]] = count();
+    @total_read_time = sum($ela_us);
+    @total_read_count = count();
+
+    delete(@io_start[tid]);
+    delete(@io_spc[tid]);
+    delete(@io_db[tid]);
+    delete(@io_rel[tid]);
+    delete(@io_fork[tid]);
+    delete(@io_blk[tid]);
+}
+
+/* mdwrite - writes one block to disk */
+uprobe:/usr/lib/postgresql/13/bin/postgres:mdwrite
+{
+    @write_start[tid] = nsecs;
+
+    $smgr = (uint64)arg0;
+    @write_rel[tid] = *(uint32*)($smgr + 8);
+    @write_blk[tid] = arg2;
+}
+
+uretprobe:/usr/lib/postgresql/13/bin/postgres:mdwrite
+/@write_start[tid]/
+{
+    $ela_us = (nsecs - @write_start[tid]) / 1000;
+
+    printf("[%d] WRITE rel=%u blk=%u ela=%lu us\n",
+           tid,
+           @write_rel[tid],
+           @write_blk[tid],
+           $ela_us);
+
+    @total_write_time = sum($ela_us);
+    @total_write_count = count();
+
+    delete(@write_start[tid]);
+    delete(@write_rel[tid]);
+    delete(@write_blk[tid]);
+}
+
+/* ReadBufferExtended - buffer manager requests (may hit cache) */
+uprobe:/usr/lib/postgresql/13/bin/postgres:ReadBufferExtended
+{
+    @buf_req_count = count();
+}
+
+END
+{
+    printf("\n=== IO Summary ===\n");
+
+    printf("\nRead time by relation OID (us):\n");
+    print(@read_time_by_rel);
+
+    printf("\nRead count by relation OID:\n");
+    print(@read_count_by_rel);
+
+    printf("\nTotal: %lld reads in %lld us, %lld writes in %lld us\n",
+           @total_read_count, @total_read_time,
+           @total_write_count, @total_write_time);
+
+    printf("Buffer requests: %lld\n", @buf_req_count);
+
+    clear(@io_start);
+    clear(@io_spc);
+    clear(@io_db);
+    clear(@io_rel);
+    clear(@io_fork);
+    clear(@io_blk);
+    clear(@write_start);
+    clear(@write_rel);
+    clear(@write_blk);
+}

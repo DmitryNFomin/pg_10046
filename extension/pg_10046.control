@@ -1,0 +1,5 @@
+# pg_10046 extension
+comment = 'Oracle 10046-style SQL tracing for PostgreSQL'
+default_version = '1.0'
+module_pathname = '$libdir/pg_10046'
+relocatable = true

@@ -1,0 +1,19 @@
+# Trace files (can be large)
+*.trc
+
+# Build artifacts
+*.o
+*.so
+*.bc
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Report files (generated)
+*_report.txt
