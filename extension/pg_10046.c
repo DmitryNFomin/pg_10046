@@ -20,6 +20,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 
 #include "commands/explain.h"
@@ -49,6 +51,11 @@ PG_MODULE_MAGIC;
 void		_PG_init(void);
 void		_PG_fini(void);
 
+/* Forward declarations for eBPF daemon communication */
+static void write_trace(const char *fmt, ...) pg_attribute_printf(1, 2);
+static void start_ebpf_trace(void);
+static void stop_ebpf_trace(void);
+
 /* Saved hook values */
 static planner_hook_type prev_planner_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
@@ -57,9 +64,13 @@ static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 /* GUC variables */
 static bool pg10046_enabled = false;
+static bool pg10046_ebpf_enabled = false;  /* Also start eBPF IO tracing */
 static char *pg10046_trace_dir = NULL;
+static char *pg10046_daemon_socket = NULL;  /* Default: /var/run/pg_10046.sock */
 static int pg10046_sample_interval_ms = 10;  /* Sample every 10ms by default */
 static int pg10046_progress_interval_tuples = 0;  /* Debug: emit PROGRESS every N tuples (0=disabled) */
+
+#define DEFAULT_DAEMON_SOCKET "/var/run/pg_10046.sock"
 
 /* Maximum depth of node stack for tracking current execution */
 #define MAX_NODE_STACK_DEPTH 64
@@ -89,6 +100,9 @@ typedef struct TraceState
 	bool		active;
 	int			trace_fd;
 	char		trace_path[MAXPGPATH];
+	char		trace_id[64];		/* <pid>_<YYYYMMDDHHMMSS> for filenames */
+	char		trace_uuid[40];		/* UUID for unique correlation */
+	uint64		start_time_ns;		/* Trace start time in nanoseconds */
 	uint64		query_id;
 	int64		plan_start_time;
 	int64		plan_end_time;
@@ -114,6 +128,10 @@ typedef struct TraceState
 
 	/* For signal handler - pointer to current planstate root */
 	PlanState  *current_planstate;
+
+	/* eBPF tracing state */
+	bool		ebpf_active;
+	char		ebpf_trace_path[MAXPGPATH];
 
 } TraceState;
 
@@ -955,6 +973,25 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("pg_10046.ebpf_enabled",
+							 "Enable eBPF IO tracing via pg_10046d daemon",
+							 "When enabled, extension automatically starts/stops eBPF "
+							 "IO tracing through the pg_10046d daemon.",
+							 &pg10046_ebpf_enabled,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pg_10046.daemon_socket",
+							   "Unix socket path for pg_10046d daemon",
+							   NULL,
+							   &pg10046_daemon_socket,
+							   DEFAULT_DAEMON_SOCKET,
+							   PGC_USERSET,
+							   0,
+							   NULL, NULL, NULL);
+
 	/*
 	 * NOTE: Timeout registration is done lazily in setup_sampling_timer()
 	 * to avoid issues with shared_preload_libraries context.
@@ -991,6 +1028,19 @@ _PG_fini(void)
 		trace_state.sampling_active = false;
 	}
 
+	/* Stop eBPF tracing if active */
+	if (trace_state.ebpf_active)
+	{
+		stop_ebpf_trace();
+	}
+
+	/* Close trace file */
+	if (trace_state.trace_fd > 0)
+	{
+		close(trace_state.trace_fd);
+		trace_state.trace_fd = 0;
+	}
+
 	/* Restore hooks */
 	planner_hook = prev_planner_hook;
 	ExecutorStart_hook = prev_ExecutorStart;
@@ -999,23 +1049,208 @@ _PG_fini(void)
 }
 
 /*
+ * Send command to pg_10046d daemon and get response
+ * Returns true on success, false on error
+ * Response is stored in response_buf (must be at least 256 bytes)
+ */
+static bool
+ebpf_daemon_command(const char *cmd, char *response_buf, size_t response_len)
+{
+	int sock;
+	struct sockaddr_un addr;
+	const char *socket_path;
+	ssize_t n;
+
+	socket_path = pg10046_daemon_socket ? pg10046_daemon_socket : DEFAULT_DAEMON_SOCKET;
+
+	/* Create Unix socket */
+	sock = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sock < 0)
+	{
+		elog(DEBUG1, "pg_10046: socket() failed: %m");
+		return false;
+	}
+
+	/* Connect to daemon */
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+	if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+	{
+		elog(DEBUG1, "pg_10046: connect to %s failed: %m", socket_path);
+		close(sock);
+		return false;
+	}
+
+	/* Send command */
+	if (write(sock, cmd, strlen(cmd)) < 0)
+	{
+		elog(DEBUG1, "pg_10046: write failed: %m");
+		close(sock);
+		return false;
+	}
+
+	/* Read response */
+	n = read(sock, response_buf, response_len - 1);
+	if (n < 0)
+	{
+		elog(DEBUG1, "pg_10046: read failed: %m");
+		close(sock);
+		return false;
+	}
+	response_buf[n] = '\0';
+
+	close(sock);
+	return true;
+}
+
+/*
+ * Start eBPF IO tracing via daemon
+ */
+static void
+start_ebpf_trace(void)
+{
+	char cmd[256];
+	char response[256];
+
+	if (trace_state.ebpf_active)
+		return;
+
+	snprintf(cmd, sizeof(cmd), "START %d %s",
+			 MyProcPid, trace_state.trace_uuid);
+
+	if (ebpf_daemon_command(cmd, response, sizeof(response)))
+	{
+		if (strncmp(response, "OK ", 3) == 0)
+		{
+			trace_state.ebpf_active = true;
+			strncpy(trace_state.ebpf_trace_path, response + 3,
+					sizeof(trace_state.ebpf_trace_path) - 1);
+			trace_state.ebpf_trace_path[sizeof(trace_state.ebpf_trace_path) - 1] = '\0';
+
+			/* Log to extension trace */
+			write_trace("# EBPF_START: %s\n", trace_state.ebpf_trace_path);
+
+			elog(DEBUG1, "pg_10046: eBPF tracing started: %s", trace_state.ebpf_trace_path);
+		}
+		else
+		{
+			elog(WARNING, "pg_10046: eBPF daemon error: %s", response);
+		}
+	}
+	else
+	{
+		elog(DEBUG1, "pg_10046: Could not connect to eBPF daemon");
+	}
+}
+
+/*
+ * Stop eBPF IO tracing via daemon
+ */
+static void
+stop_ebpf_trace(void)
+{
+	char cmd[64];
+	char response[256];
+
+	if (!trace_state.ebpf_active)
+		return;
+
+	snprintf(cmd, sizeof(cmd), "STOP %d", MyProcPid);
+
+	if (ebpf_daemon_command(cmd, response, sizeof(response)))
+	{
+		if (strncmp(response, "OK ", 3) == 0)
+		{
+			/* Log to extension trace */
+			write_trace("# EBPF_STOP: %s\n", response + 3);
+			elog(DEBUG1, "pg_10046: eBPF tracing stopped: %s", response + 3);
+		}
+	}
+
+	trace_state.ebpf_active = false;
+	trace_state.ebpf_trace_path[0] = '\0';
+}
+
+/*
+ * Generate a simple UUID v4 (random-based)
+ * Format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+ */
+static void
+generate_uuid(char *buf, size_t buflen)
+{
+	static bool seeded = false;
+	uint32 r1, r2, r3, r4;
+
+	if (!seeded)
+	{
+		struct timespec ts;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		srand((unsigned int)(ts.tv_nsec ^ ts.tv_sec ^ MyProcPid));
+		seeded = true;
+	}
+
+	r1 = (uint32) rand();
+	r2 = (uint32) rand();
+	r3 = (uint32) rand();
+	r4 = (uint32) rand();
+
+	/* Format as UUID v4: set version (4) and variant bits */
+	snprintf(buf, buflen,
+			 "%08x-%04x-4%03x-%x%03x-%04x%08x",
+			 r1,
+			 (r2 >> 16) & 0xFFFF,
+			 r2 & 0x0FFF,
+			 8 + (rand() % 4),  /* variant: 8, 9, a, or b */
+			 r3 & 0x0FFF,
+			 (r3 >> 12) & 0xFFFF,
+			 r4);
+}
+
+/*
  * Open trace file for current backend
+ *
+ * File naming: pg_10046_<trace_id>.trc
+ * Where trace_id = <pid>_<YYYYMMDDHHMMSS>
+ *
+ * Header includes:
+ * - TRACE_ID: human-readable identifier for filenames
+ * - TRACE_UUID: unique identifier for programmatic correlation
  */
 static void
 open_trace_file(void)
 {
 	struct timespec ts;
+	time_t now;
+	struct tm *tm_info;
+	char timestamp[20];
 
 	if (trace_state.trace_fd > 0)
 		return;
 
 	clock_gettime(CLOCK_REALTIME, &ts);
+	now = time(NULL);
+	tm_info = localtime(&now);
 
+	/* Generate timestamp as YYYYMMDDHHMMSS */
+	strftime(timestamp, sizeof(timestamp), "%Y%m%d%H%M%S", tm_info);
+
+	/* Generate TRACE_ID: <pid>_<timestamp> */
+	snprintf(trace_state.trace_id, sizeof(trace_state.trace_id),
+			 "%d_%s", MyProcPid, timestamp);
+
+	/* Generate UUID for unique correlation */
+	generate_uuid(trace_state.trace_uuid, sizeof(trace_state.trace_uuid));
+
+	/* Store start time in nanoseconds */
+	trace_state.start_time_ns = (uint64) ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+	/* File naming: pg_10046_<trace_id>.trc */
 	snprintf(trace_state.trace_path, MAXPGPATH,
-			 "%s/pg_10046_ext.%d.%ld.trc",
+			 "%s/pg_10046_%s.trc",
 			 pg10046_trace_dir ? pg10046_trace_dir : "/tmp",
-			 MyProcPid,
-			 ts.tv_sec);
+			 trace_state.trace_id);
 
 	trace_state.trace_fd = open(trace_state.trace_path,
 								O_WRONLY | O_CREAT | O_TRUNC,
@@ -1034,24 +1269,26 @@ open_trace_file(void)
 	trace_state.query_id = 0;
 	trace_state.call_stack_depth = 0;
 
-	/* Write trace header with YYYYMMDDHHMMSS timestamp */
-	{
-		time_t now = time(NULL);
-		struct tm *tm_info = localtime(&now);
-		char ts_buf[20];
-		strftime(ts_buf, sizeof(ts_buf), "%Y%m%d%H%M%S", tm_info);
+	/* Write trace header */
+	write_trace("# PG_10046 TRACE\n");
+	write_trace("# TRACE_ID: %s\n", trace_state.trace_id);
+	write_trace("# TRACE_UUID: %s\n", trace_state.trace_uuid);
+	write_trace("# PID: %d\n", MyProcPid);
+	write_trace("# START_TIME: %lu\n", (unsigned long) trace_state.start_time_ns);
+	write_trace("# SAMPLE_INTERVAL_MS: %d\n", pg10046_sample_interval_ms);
+	write_trace("# EBPF_ENABLED: %s\n", pg10046_ebpf_enabled ? "true" : "false");
+	write_trace("#\n");
 
-		write_trace("# PG_10046 EXTENSION TRACE\n");
-		write_trace("# PID: %d\n", MyProcPid);
-		write_trace("# TIMESTAMP: %s\n", ts_buf);
-		write_trace("# SAMPLE_INTERVAL_MS: %d\n", pg10046_sample_interval_ms);
-		write_trace("# PROGRESS_INTERVAL_TUPLES: %d\n", pg10046_progress_interval_tuples);
-		write_trace("#\n");
-		write_trace("# EVENT FORMATS:\n");
-		write_trace("# NODE_START: ts,instr_ptr,node_type,target\n");
-		write_trace("# NODE_END: ts,instr_ptr,node_type,tuples=N,blks_hit=N,blks_read=N,time_us=N,target\n");
-		write_trace("# SAMPLE: ts,instr_ptr,wait_event,sample_num,tuples,blks_hit,blks_read\n");
-		write_trace("# PROGRESS: ts,instr_ptr,node_type,tuples,blks_hit,blks_read (debug mode)\n");
+	/* Start eBPF tracing if enabled */
+	if (pg10046_ebpf_enabled)
+	{
+		start_ebpf_trace();
+	}
+	else
+	{
+		write_trace("# To collect IO events manually, start eBPF tracer:\n");
+		write_trace("#   pg_10046_ebpf.sh start %d %s\n", MyProcPid, trace_state.trace_uuid);
+		write_trace("# eBPF trace file: pg_10046_io_%s.trc\n", trace_state.trace_id);
 		write_trace("#\n");
 	}
 }
@@ -2164,6 +2401,12 @@ pg10046_ExecutorEnd(QueryDesc *queryDesc)
 					end_time,
 					trace_state.query_id,
 					elapsed);
+
+		/* Stop eBPF tracing if active */
+		if (trace_state.ebpf_active)
+		{
+			stop_ebpf_trace();
+		}
 
 		trace_state.nesting_level--;
 		trace_state.current_planstate = NULL;

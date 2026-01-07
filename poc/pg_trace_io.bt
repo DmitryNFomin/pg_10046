@@ -1,0 +1,222 @@
+#!/usr/bin/env bpftrace
+/*
+ * pg_trace_io.bt - PostgreSQL IO Tracer
+ *
+ * Tracks all physical IO operations with:
+ * - IO type (read/write)
+ * - File identification (tablespace, database, relation, fork, segment)
+ * - Block number within segment
+ * - Timing (elapsed microseconds)
+ * - Associated plan node (if during query execution)
+ *
+ * Usage:
+ *   sudo bpftrace pg_trace_io.bt
+ *   sudo bpftrace pg_trace_io.bt -p <postgres_pid>
+ *
+ * Output format:
+ *   timestamp,IO_READ|IO_WRITE,node_ptr,spc,db,rel,fork,seg,blk,ela_us
+ *
+ * PostgreSQL file layout:
+ *   $PGDATA/base/<db_oid>/<relfilenode>       (segment 0)
+ *   $PGDATA/base/<db_oid>/<relfilenode>.1     (segment 1)
+ *   ...
+ *   Segment size: 1GB = 131072 blocks (8KB each)
+ */
+
+/* Segment size in blocks (1GB / 8KB = 131072) */
+#define RELSEG_SIZE 131072
+
+BEGIN {
+    printf("# PG_TRACE_IO - PostgreSQL IO Tracer\n");
+    printf("# TIMESTAMP: %s\n", strftime("%Y%m%d%H%M%S", nsecs));
+    printf("# FORMAT: ts,event,node_ptr,spc,db,rel,fork,seg,blk,ela_us\n");
+    printf("# FORK: 0=main, 1=fsm, 2=vm, 3=init\n");
+    printf("#\n");
+}
+
+/*
+ * Track query execution for node association
+ */
+uprobe:/usr/pgsql-13/bin/postgres:standard_ExecutorRun {
+    @in_query[tid] = 1;
+}
+
+uretprobe:/usr/pgsql-13/bin/postgres:standard_ExecutorRun /@in_query[tid]/ {
+    delete(@in_query[tid]);
+}
+
+/*
+ * Track plan node execution for IO attribution
+ * InstrStartNode/InstrStopNode bracket node execution
+ */
+uprobe:/usr/pgsql-13/bin/postgres:InstrStartNode {
+    @depth[tid]++;
+    $d = @depth[tid];
+    @node_stack[tid, $d] = arg0;  /* Instrumentation pointer */
+}
+
+uprobe:/usr/pgsql-13/bin/postgres:InstrStopNode {
+    $d = @depth[tid];
+    @node_stack[tid, $d] = 0;
+    if ($d > 0) {
+        @depth[tid] = $d - 1;
+    }
+}
+
+/*
+ * mdread - Physical block read
+ *
+ * void mdread(SMgrRelation reln, ForkNumber forknum,
+ *             BlockNumber blocknum, char *buffer)
+ *
+ * SMgrRelation structure (simplified):
+ *   offset 0:  Oid spcNode   (tablespace)
+ *   offset 4:  Oid dbNode    (database)
+ *   offset 8:  Oid relNode   (relation)
+ */
+uprobe:/usr/pgsql-13/bin/postgres:mdread {
+    @rd_start[tid] = nsecs;
+
+    /* Extract RelFileNode from SMgrRelation */
+    @rd_spc[tid] = *(uint32*)(arg0 + 0);
+    @rd_db[tid]  = *(uint32*)(arg0 + 4);
+    @rd_rel[tid] = *(uint32*)(arg0 + 8);
+    @rd_fork[tid] = arg1;
+    @rd_blk[tid] = arg2;
+
+    /* Calculate segment number */
+    @rd_seg[tid] = arg2 / RELSEG_SIZE;
+
+    /* Get current node from stack */
+    $d = @depth[tid];
+    @rd_node[tid] = ($d > 0) ? @node_stack[tid, $d] : 0;
+}
+
+uretprobe:/usr/pgsql-13/bin/postgres:mdread /@rd_start[tid]/ {
+    $ela = (nsecs - @rd_start[tid]) / 1000;  /* microseconds */
+
+    printf("%lu,IO_READ,0x%lx,%u,%u,%u,%u,%u,%u,%lu\n",
+           nsecs / 1000,
+           @rd_node[tid],
+           @rd_spc[tid],
+           @rd_db[tid],
+           @rd_rel[tid],
+           @rd_fork[tid],
+           @rd_seg[tid],
+           @rd_blk[tid],
+           $ela);
+
+    /* Update statistics */
+    @read_count++;
+    @read_time += $ela;
+    @read_by_rel[@rd_rel[tid]] = count();
+
+    /* Cleanup */
+    delete(@rd_start[tid]);
+    delete(@rd_spc[tid]);
+    delete(@rd_db[tid]);
+    delete(@rd_rel[tid]);
+    delete(@rd_fork[tid]);
+    delete(@rd_blk[tid]);
+    delete(@rd_seg[tid]);
+    delete(@rd_node[tid]);
+}
+
+/*
+ * mdwrite - Physical block write
+ *
+ * void mdwrite(SMgrRelation reln, ForkNumber forknum,
+ *              BlockNumber blocknum, char *buffer, bool skipFsync)
+ */
+uprobe:/usr/pgsql-13/bin/postgres:mdwrite {
+    @wr_start[tid] = nsecs;
+
+    @wr_spc[tid] = *(uint32*)(arg0 + 0);
+    @wr_db[tid]  = *(uint32*)(arg0 + 4);
+    @wr_rel[tid] = *(uint32*)(arg0 + 8);
+    @wr_fork[tid] = arg1;
+    @wr_blk[tid] = arg2;
+    @wr_seg[tid] = arg2 / RELSEG_SIZE;
+
+    $d = @depth[tid];
+    @wr_node[tid] = ($d > 0) ? @node_stack[tid, $d] : 0;
+}
+
+uretprobe:/usr/pgsql-13/bin/postgres:mdwrite /@wr_start[tid]/ {
+    $ela = (nsecs - @wr_start[tid]) / 1000;
+
+    printf("%lu,IO_WRITE,0x%lx,%u,%u,%u,%u,%u,%u,%lu\n",
+           nsecs / 1000,
+           @wr_node[tid],
+           @wr_spc[tid],
+           @wr_db[tid],
+           @wr_rel[tid],
+           @wr_fork[tid],
+           @wr_seg[tid],
+           @wr_blk[tid],
+           $ela);
+
+    @write_count++;
+    @write_time += $ela;
+    @write_by_rel[@wr_rel[tid]] = count();
+
+    delete(@wr_start[tid]);
+    delete(@wr_spc[tid]);
+    delete(@wr_db[tid]);
+    delete(@wr_rel[tid]);
+    delete(@wr_fork[tid]);
+    delete(@wr_blk[tid]);
+    delete(@wr_seg[tid]);
+    delete(@wr_node[tid]);
+}
+
+/*
+ * mdextend - Extend relation by one block (allocate new block)
+ */
+uprobe:/usr/pgsql-13/bin/postgres:mdextend {
+    @ext_start[tid] = nsecs;
+    @ext_rel[tid] = *(uint32*)(arg0 + 8);
+    @ext_blk[tid] = arg2;
+}
+
+uretprobe:/usr/pgsql-13/bin/postgres:mdextend /@ext_start[tid]/ {
+    $ela = (nsecs - @ext_start[tid]) / 1000;
+
+    printf("%lu,IO_EXTEND,0,0,0,%u,0,%u,%u,%lu\n",
+           nsecs / 1000,
+           @ext_rel[tid],
+           @ext_blk[tid] / RELSEG_SIZE,
+           @ext_blk[tid],
+           $ela);
+
+    @extend_count++;
+
+    delete(@ext_start[tid]);
+    delete(@ext_rel[tid]);
+    delete(@ext_blk[tid]);
+}
+
+END {
+    printf("\n# === IO SUMMARY ===\n");
+    printf("# Reads:   %lu calls, %lu us total\n", @read_count, @read_time);
+    printf("# Writes:  %lu calls, %lu us total\n", @write_count, @write_time);
+    printf("# Extends: %lu calls\n", @extend_count);
+
+    printf("\n# === READS BY RELATION ===\n");
+    print(@read_by_rel);
+
+    printf("\n# === WRITES BY RELATION ===\n");
+    print(@write_by_rel);
+
+    /* Cleanup */
+    clear(@depth);
+    clear(@node_stack);
+    clear(@in_query);
+    clear(@read_count);
+    clear(@read_time);
+    clear(@write_count);
+    clear(@write_time);
+    clear(@extend_count);
+    clear(@read_by_rel);
+    clear(@write_by_rel);
+}
