@@ -12,8 +12,28 @@
 *~
 .DS_Store
 
+# IDE
+.vscode/
+.idea/
+
 # Claude Code
 .claude/
 
 # Report files (generated)
 *_report.txt
+
+# Temporary files
+/tmp/
+*.log
+*.pid
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# PostgreSQL regression test output
+regression.diffs
+regression.out
+results/
