@@ -24,6 +24,16 @@
 #include <sys/un.h>
 #include <time.h>
 
+/* Background worker and shared memory */
+#include "postmaster/bgworker.h"
+#include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "storage/spin.h"
+#include "storage/pg_sema.h"
+#include "storage/procsignal.h"
+#include "storage/latch.h"
+
 #include "commands/explain.h"
 #include "access/relscan.h"
 #include "executor/executor.h"
@@ -70,7 +80,96 @@ static char *pg10046_daemon_socket = NULL;  /* Default: /var/run/pg_10046.sock *
 static int pg10046_sample_interval_ms = 10;  /* Sample every 10ms by default */
 static int pg10046_progress_interval_tuples = 0;  /* Debug: emit PROGRESS every N tuples (0=disabled) */
 
+/* Ring buffer GUC variables */
+static int pg10046_ring_buffer_mb = 32;       /* Ring buffer size in MB (default 32MB) */
+static int pg10046_flush_interval_ms = 1000;  /* Flush interval in ms (default 1 second) */
+
 #define DEFAULT_DAEMON_SOCKET "/var/run/pg_10046.sock"
+#define TRACE_SLOT_SIZE 512                   /* Size of each trace slot in bytes */
+#define TRACE_SLOT_DATA_SIZE (TRACE_SLOT_SIZE - 16)  /* Data area per slot */
+#define MAX_TRACED_BACKENDS 128               /* Max concurrent traced backends */
+
+/*
+ * Ring buffer slot for trace events.
+ * Each slot is fixed-size to allow lock-free operations.
+ */
+typedef struct TraceSlot
+{
+	pg_atomic_uint32 state;      /* 0=free, 1=writing, 2=ready */
+	uint32      pid;             /* Backend PID */
+	uint16      len;             /* Data length */
+	uint16      flags;           /* Reserved for future use */
+	char        data[TRACE_SLOT_DATA_SIZE];  /* Trace event data */
+} TraceSlot;
+
+/* State values for TraceSlot.state */
+#define SLOT_FREE    0
+#define SLOT_WRITING 1
+#define SLOT_READY   2
+
+/*
+ * Per-backend trace registration in shared memory.
+ * Background worker uses this to know which files to write to.
+ */
+typedef struct TracedBackend
+{
+	pg_atomic_uint32 active;     /* 0=inactive, 1=active */
+	uint32      pid;             /* Backend PID */
+	char        trace_path[MAXPGPATH];  /* Output file path */
+	char        trace_id[64];    /* Trace ID for correlation */
+	char        trace_uuid[40];  /* UUID for correlation */
+	uint64      start_time_ns;   /* Trace start time */
+	pg_atomic_uint64 events_written;   /* Events written to file */
+	pg_atomic_uint64 events_dropped;   /* Events dropped (buffer full) */
+} TracedBackend;
+
+/*
+ * Shared memory control structure for the ring buffer.
+ */
+typedef struct RingBufferCtl
+{
+	/* Ring buffer pointers */
+	pg_atomic_uint64 head;       /* Next slot to write (producers) */
+	pg_atomic_uint64 tail;       /* Next slot to read (consumer) */
+	uint64      num_slots;       /* Total number of slots */
+
+	/* Statistics */
+	pg_atomic_uint64 total_events;
+	pg_atomic_uint64 dropped_events;
+
+	/* Backend registration */
+	TracedBackend backends[MAX_TRACED_BACKENDS];
+
+	/* Worker state */
+	pg_atomic_uint32 worker_running;
+	Latch      *worker_latch;    /* For signaling the worker */
+
+	/* The actual ring buffer follows this structure in memory */
+} RingBufferCtl;
+
+/* Shared memory pointers */
+static RingBufferCtl *ring_buffer_ctl = NULL;
+static TraceSlot *ring_buffer_slots = NULL;
+
+/* Saved hook for shared memory startup */
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+/* Background worker handle */
+static BackgroundWorkerHandle *pg10046_worker_handle = NULL;
+
+/* Function declarations for ring buffer operations */
+static void pg10046_shmem_startup(void);
+static Size pg10046_shmem_size(void);
+
+/* Background worker entry point - must be non-static for dynamic lookup */
+PGDLLEXPORT void pg10046_worker_main(Datum main_arg) pg_attribute_noreturn();
+
+static bool ring_buffer_write(const char *data, int len);
+static int  register_traced_backend(void);
+static void unregister_traced_backend(int slot);
+
+/* Per-backend slot for traced backend registration */
+static int my_backend_slot = -1;
 
 /* Maximum depth of node stack for tracking current execution */
 #define MAX_NODE_STACK_DEPTH 64
@@ -78,23 +177,7 @@ static int pg10046_progress_interval_tuples = 0;  /* Debug: emit PROGRESS every 
 /* Maximum number of nodes we can wrap */
 #define MAX_WRAPPED_NODES 256
 
-/* Storage for original ExecProcNode pointers and node tracking state */
-typedef struct WrappedNode {
-	PlanState  *node;
-	ExecProcNodeMtd original_func;  /* Original ExecProcNode, NOT ExecProcNodeReal */
-
-	/* Node lifecycle tracking */
-	bool        started;            /* Has NODE_START been emitted? */
-	bool        finished;           /* Has NODE_END been emitted? */
-	int64       start_time;         /* Timestamp when node started */
-	int64       last_call_time;     /* Timestamp of last ExecProcNode call (for early-stop) */
-	double      last_progress_tuples; /* Tuple count at last PROGRESS emit */
-} WrappedNode;
-
-static WrappedNode wrapped_nodes[MAX_WRAPPED_NODES];
-static int num_wrapped_nodes = 0;
-
-/* Per-backend state */
+/* Per-backend state - defined early so ring buffer functions can use it */
 typedef struct TraceState
 {
 	bool		active;
@@ -136,6 +219,462 @@ typedef struct TraceState
 } TraceState;
 
 static TraceState trace_state = {0};
+
+/*
+ * Calculate shared memory size for ring buffer.
+ * Called during _PG_init to request shared memory.
+ */
+static Size
+pg10046_shmem_size(void)
+{
+	Size		size;
+	uint64		num_slots;
+
+	/* Calculate number of slots that fit in configured MB */
+	num_slots = ((uint64) pg10046_ring_buffer_mb * 1024 * 1024) / TRACE_SLOT_SIZE;
+
+	/* Control structure */
+	size = MAXALIGN(sizeof(RingBufferCtl));
+
+	/* Ring buffer slots */
+	size = add_size(size, mul_size(num_slots, sizeof(TraceSlot)));
+
+	return size;
+}
+
+/*
+ * Shared memory startup hook.
+ * Initializes the ring buffer control structure and slots.
+ */
+static void
+pg10046_shmem_startup(void)
+{
+	bool		found;
+	Size		size;
+	uint64		num_slots;
+	int			i;
+
+	/* Call previous hook if any */
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	/* Create or attach to shared memory segment */
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	size = pg10046_shmem_size();
+	ring_buffer_ctl = ShmemInitStruct("pg_10046 ring buffer",
+									   size,
+									   &found);
+
+	if (!found)
+	{
+		/* First time - initialize the control structure */
+		num_slots = ((uint64) pg10046_ring_buffer_mb * 1024 * 1024) / TRACE_SLOT_SIZE;
+
+		/* Initialize control structure */
+		pg_atomic_init_u64(&ring_buffer_ctl->head, 0);
+		pg_atomic_init_u64(&ring_buffer_ctl->tail, 0);
+		ring_buffer_ctl->num_slots = num_slots;
+		pg_atomic_init_u64(&ring_buffer_ctl->total_events, 0);
+		pg_atomic_init_u64(&ring_buffer_ctl->dropped_events, 0);
+		pg_atomic_init_u32(&ring_buffer_ctl->worker_running, 0);
+		ring_buffer_ctl->worker_latch = NULL;
+
+		/* Initialize backend slots */
+		for (i = 0; i < MAX_TRACED_BACKENDS; i++)
+		{
+			pg_atomic_init_u32(&ring_buffer_ctl->backends[i].active, 0);
+			ring_buffer_ctl->backends[i].pid = 0;
+			ring_buffer_ctl->backends[i].trace_path[0] = '\0';
+			ring_buffer_ctl->backends[i].trace_id[0] = '\0';
+			ring_buffer_ctl->backends[i].trace_uuid[0] = '\0';
+			ring_buffer_ctl->backends[i].start_time_ns = 0;
+			pg_atomic_init_u64(&ring_buffer_ctl->backends[i].events_written, 0);
+			pg_atomic_init_u64(&ring_buffer_ctl->backends[i].events_dropped, 0);
+		}
+
+		/* Point to the ring buffer slots (after control structure) */
+		ring_buffer_slots = (TraceSlot *) ((char *) ring_buffer_ctl +
+										   MAXALIGN(sizeof(RingBufferCtl)));
+
+		/* Initialize all slots as free */
+		for (i = 0; i < (int) num_slots; i++)
+		{
+			pg_atomic_init_u32(&ring_buffer_slots[i].state, SLOT_FREE);
+			ring_buffer_slots[i].pid = 0;
+			ring_buffer_slots[i].len = 0;
+			ring_buffer_slots[i].flags = 0;
+		}
+
+		elog(LOG, "pg_10046: initialized ring buffer with %lu slots (%d MB)",
+			 num_slots, pg10046_ring_buffer_mb);
+	}
+	else
+	{
+		/* Attach to existing - just need to set up our local pointer */
+		ring_buffer_slots = (TraceSlot *) ((char *) ring_buffer_ctl +
+										   MAXALIGN(sizeof(RingBufferCtl)));
+	}
+
+	LWLockRelease(AddinShmemInitLock);
+}
+
+/*
+ * Register current backend as traced.
+ * Returns slot index, or -1 if no slots available.
+ */
+static int
+register_traced_backend(void)
+{
+	int		i;
+
+	if (ring_buffer_ctl == NULL)
+		return -1;
+
+	/* Find a free slot */
+	for (i = 0; i < MAX_TRACED_BACKENDS; i++)
+	{
+		uint32 expected = 0;
+
+		if (pg_atomic_compare_exchange_u32(&ring_buffer_ctl->backends[i].active,
+										   &expected, 1))
+		{
+			/* Got the slot - fill in details */
+			ring_buffer_ctl->backends[i].pid = MyProcPid;
+			strlcpy(ring_buffer_ctl->backends[i].trace_path,
+					trace_state.trace_path, MAXPGPATH);
+			strlcpy(ring_buffer_ctl->backends[i].trace_id,
+					trace_state.trace_id, sizeof(ring_buffer_ctl->backends[i].trace_id));
+			strlcpy(ring_buffer_ctl->backends[i].trace_uuid,
+					trace_state.trace_uuid, sizeof(ring_buffer_ctl->backends[i].trace_uuid));
+			ring_buffer_ctl->backends[i].start_time_ns = trace_state.start_time_ns;
+			pg_atomic_write_u64(&ring_buffer_ctl->backends[i].events_written, 0);
+			pg_atomic_write_u64(&ring_buffer_ctl->backends[i].events_dropped, 0);
+
+			/* Memory barrier to ensure all writes are visible */
+			pg_memory_barrier();
+
+			return i;
+		}
+	}
+
+	elog(WARNING, "pg_10046: no available slots for traced backend (max %d)",
+		 MAX_TRACED_BACKENDS);
+	return -1;
+}
+
+/*
+ * Unregister backend from traced list.
+ */
+static void
+unregister_traced_backend(int slot)
+{
+	if (ring_buffer_ctl == NULL || slot < 0 || slot >= MAX_TRACED_BACKENDS)
+		return;
+
+	/* Clear the slot */
+	ring_buffer_ctl->backends[slot].pid = 0;
+	ring_buffer_ctl->backends[slot].trace_path[0] = '\0';
+
+	/* Memory barrier before marking inactive */
+	pg_memory_barrier();
+
+	pg_atomic_write_u32(&ring_buffer_ctl->backends[slot].active, 0);
+}
+
+/*
+ * Write trace event to ring buffer (lock-free).
+ * Returns true on success, false if buffer full (event dropped).
+ *
+ * This is designed to be fast and non-blocking:
+ * 1. Atomically claim a slot (increment head)
+ * 2. Check if slot is within bounds (not overwriting unread data)
+ * 3. Write data and mark slot as ready
+ * 4. Signal background worker
+ */
+static bool
+ring_buffer_write(const char *data, int len)
+{
+	uint64		head;
+	uint64		tail;
+	uint64		slot_idx;
+	TraceSlot  *slot;
+	uint32		expected;
+
+	if (ring_buffer_ctl == NULL || ring_buffer_slots == NULL)
+		return false;
+
+	/* Truncate if too long */
+	if (len > TRACE_SLOT_DATA_SIZE - 1)
+		len = TRACE_SLOT_DATA_SIZE - 1;
+
+	/*
+	 * Atomically claim a slot by incrementing head.
+	 * Use fetch_add which returns the old value.
+	 */
+	head = pg_atomic_fetch_add_u64(&ring_buffer_ctl->head, 1);
+	slot_idx = head % ring_buffer_ctl->num_slots;
+
+	/*
+	 * Check if we're about to overwrite data that hasn't been read yet.
+	 * If head - tail >= num_slots, the buffer is full.
+	 */
+	tail = pg_atomic_read_u64(&ring_buffer_ctl->tail);
+	if (head - tail >= ring_buffer_ctl->num_slots)
+	{
+		/* Buffer full - drop event */
+		pg_atomic_fetch_add_u64(&ring_buffer_ctl->dropped_events, 1);
+
+		if (my_backend_slot >= 0)
+			pg_atomic_fetch_add_u64(&ring_buffer_ctl->backends[my_backend_slot].events_dropped, 1);
+
+		/* Log warning periodically (every 1000 drops) */
+		{
+			uint64 dropped = pg_atomic_read_u64(&ring_buffer_ctl->dropped_events);
+			if (dropped % 1000 == 0)
+			{
+				elog(WARNING, "pg_10046: ring buffer full, %lu events dropped",
+					 dropped);
+			}
+		}
+
+		return false;
+	}
+
+	slot = &ring_buffer_slots[slot_idx];
+
+	/*
+	 * Wait for slot to be free (in case consumer hasn't processed it yet).
+	 * This should be rare with a properly sized buffer.
+	 */
+	expected = SLOT_FREE;
+	while (!pg_atomic_compare_exchange_u32(&slot->state, &expected, SLOT_WRITING))
+	{
+		expected = SLOT_FREE;
+		pg_spin_delay();
+	}
+
+	/* Write data */
+	slot->pid = MyProcPid;
+	slot->len = len;
+	slot->flags = 0;
+	memcpy(slot->data, data, len);
+	slot->data[len] = '\0';
+
+	/* Mark slot as ready for consumer */
+	pg_memory_barrier();
+	pg_atomic_write_u32(&slot->state, SLOT_READY);
+
+	/* Update statistics */
+	pg_atomic_fetch_add_u64(&ring_buffer_ctl->total_events, 1);
+	if (my_backend_slot >= 0)
+		pg_atomic_fetch_add_u64(&ring_buffer_ctl->backends[my_backend_slot].events_written, 1);
+
+	/* Signal worker that there's data to write */
+	if (ring_buffer_ctl->worker_latch != NULL)
+		SetLatch(ring_buffer_ctl->worker_latch);
+
+	return true;
+}
+
+/* Signal handling for background worker */
+static volatile sig_atomic_t pg10046_got_sigterm = false;
+static volatile sig_atomic_t pg10046_got_sighup = false;
+
+static void
+pg10046_sigterm_handler(SIGNAL_ARGS)
+{
+	int save_errno = errno;
+	pg10046_got_sigterm = true;
+	SetLatch(MyLatch);
+	errno = save_errno;
+}
+
+static void
+pg10046_sighup_handler(SIGNAL_ARGS)
+{
+	int save_errno = errno;
+	pg10046_got_sighup = true;
+	SetLatch(MyLatch);
+	errno = save_errno;
+}
+
+/*
+ * Background worker main function.
+ * Reads trace events from ring buffer and writes them to trace files.
+ */
+void
+pg10046_worker_main(Datum main_arg)
+{
+	int			fd_cache[MAX_TRACED_BACKENDS];
+	int			i;
+
+	/* Initialize file descriptor cache */
+	for (i = 0; i < MAX_TRACED_BACKENDS; i++)
+		fd_cache[i] = -1;
+
+	/* Establish signal handlers */
+	pqsignal(SIGTERM, pg10046_sigterm_handler);
+	pqsignal(SIGHUP, pg10046_sighup_handler);
+
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
+
+	/* Register our latch with the ring buffer */
+	if (ring_buffer_ctl != NULL)
+	{
+		ring_buffer_ctl->worker_latch = MyLatch;
+		pg_atomic_write_u32(&ring_buffer_ctl->worker_running, 1);
+	}
+
+	elog(LOG, "pg_10046: trace writer background worker started");
+
+	/* Main loop */
+	while (!pg10046_got_sigterm)
+	{
+		uint64		tail;
+		uint64		head;
+		bool		did_work = false;
+		int			rc;
+
+		/* Check for config reload */
+		if (pg10046_got_sighup)
+		{
+			pg10046_got_sighup = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+
+		/* Process pending trace events */
+		if (ring_buffer_ctl != NULL && ring_buffer_slots != NULL)
+		{
+			tail = pg_atomic_read_u64(&ring_buffer_ctl->tail);
+			head = pg_atomic_read_u64(&ring_buffer_ctl->head);
+
+			while (tail < head)
+			{
+				uint64		slot_idx = tail % ring_buffer_ctl->num_slots;
+				TraceSlot  *slot = &ring_buffer_slots[slot_idx];
+				uint32		state;
+
+				/* Check if slot is ready */
+				state = pg_atomic_read_u32(&slot->state);
+				if (state != SLOT_READY)
+				{
+					/* Slot not ready yet, try later */
+					break;
+				}
+
+				/* Find the trace file for this backend */
+				{
+					int		backend_slot = -1;
+					uint32	pid = slot->pid;
+
+					/* Look up backend by PID */
+					for (i = 0; i < MAX_TRACED_BACKENDS; i++)
+					{
+						if (pg_atomic_read_u32(&ring_buffer_ctl->backends[i].active) &&
+							ring_buffer_ctl->backends[i].pid == pid)
+						{
+							backend_slot = i;
+							break;
+						}
+					}
+
+					if (backend_slot >= 0)
+					{
+						/* Open file if not cached */
+						if (fd_cache[backend_slot] < 0)
+						{
+							fd_cache[backend_slot] = open(
+								ring_buffer_ctl->backends[backend_slot].trace_path,
+								O_WRONLY | O_CREAT | O_APPEND,
+								S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+							if (fd_cache[backend_slot] < 0)
+							{
+								elog(WARNING, "pg_10046: could not open trace file %s: %m",
+									 ring_buffer_ctl->backends[backend_slot].trace_path);
+							}
+						}
+
+						/* Write to file */
+						if (fd_cache[backend_slot] >= 0)
+						{
+							ssize_t ret pg_attribute_unused();
+							ret = write(fd_cache[backend_slot], slot->data, slot->len);
+						}
+					}
+				}
+
+				/* Mark slot as free */
+				pg_atomic_write_u32(&slot->state, SLOT_FREE);
+
+				/* Advance tail */
+				pg_atomic_fetch_add_u64(&ring_buffer_ctl->tail, 1);
+				tail++;
+				did_work = true;
+			}
+
+			/* Close files for inactive backends */
+			for (i = 0; i < MAX_TRACED_BACKENDS; i++)
+			{
+				if (fd_cache[i] >= 0 &&
+					!pg_atomic_read_u32(&ring_buffer_ctl->backends[i].active))
+				{
+					/* Backend is done - sync and close file */
+					fsync(fd_cache[i]);
+					close(fd_cache[i]);
+					fd_cache[i] = -1;
+				}
+			}
+		}
+
+		/* Wait for work or timeout */
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   did_work ? 0 : pg10046_flush_interval_ms,
+					   PG_WAIT_EXTENSION);
+
+		if (rc & WL_LATCH_SET)
+			ResetLatch(MyLatch);
+	}
+
+	/* Cleanup */
+	if (ring_buffer_ctl != NULL)
+	{
+		pg_atomic_write_u32(&ring_buffer_ctl->worker_running, 0);
+		ring_buffer_ctl->worker_latch = NULL;
+	}
+
+	/* Close all cached file descriptors */
+	for (i = 0; i < MAX_TRACED_BACKENDS; i++)
+	{
+		if (fd_cache[i] >= 0)
+		{
+			fsync(fd_cache[i]);
+			close(fd_cache[i]);
+		}
+	}
+
+	elog(LOG, "pg_10046: trace writer background worker stopped");
+	proc_exit(0);
+}
+
+/* Storage for original ExecProcNode pointers and node tracking state */
+typedef struct WrappedNode {
+	PlanState  *node;
+	ExecProcNodeMtd original_func;  /* Original ExecProcNode, NOT ExecProcNodeReal */
+
+	/* Node lifecycle tracking */
+	bool        started;            /* Has NODE_START been emitted? */
+	bool        finished;           /* Has NODE_END been emitted? */
+	int64       start_time;         /* Timestamp when node started */
+	int64       last_call_time;     /* Timestamp of last ExecProcNode call (for early-stop) */
+	double      last_progress_tuples; /* Tuple count at last PROGRESS emit */
+} WrappedNode;
+
+static WrappedNode wrapped_nodes[MAX_WRAPPED_NODES];
+static int num_wrapped_nodes = 0;
 
 /* Timeout-based sampling state */
 static volatile sig_atomic_t sample_pending = 0;
@@ -992,6 +1531,65 @@ _PG_init(void)
 							   0,
 							   NULL, NULL, NULL);
 
+	DefineCustomIntVariable("pg_10046.ring_buffer_mb",
+							"Size of ring buffer for trace events in MB",
+							"Trace events are buffered in shared memory and written "
+							"to disk by a background worker. Default is 32MB.",
+							&pg10046_ring_buffer_mb,
+							32,     /* default 32MB */
+							1,      /* min 1MB */
+							1024,   /* max 1GB */
+							PGC_POSTMASTER,
+							GUC_UNIT_MB,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pg_10046.flush_interval_ms",
+							"Interval for flushing trace buffer to disk in ms",
+							"Background worker flushes accumulated trace events "
+							"to disk at this interval. Default is 1000ms.",
+							&pg10046_flush_interval_ms,
+							1000,   /* default 1 second */
+							100,    /* min 100ms */
+							60000,  /* max 60 seconds */
+							PGC_SIGHUP,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	/*
+	 * Request shared memory for ring buffer.
+	 * This must be done in _PG_init before shared memory is allocated.
+	 */
+	RequestAddinShmemSpace(pg10046_shmem_size());
+	RequestNamedLWLockTranche("pg_10046", 1);
+
+	/*
+	 * Register background worker.
+	 * The worker will be started when PostgreSQL starts.
+	 */
+	{
+		BackgroundWorker worker;
+
+		memset(&worker, 0, sizeof(worker));
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+		worker.bgw_start_time = BgWorkerStart_PostmasterStart;
+		worker.bgw_restart_time = BGW_NEVER_RESTART;
+		snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_10046");
+		snprintf(worker.bgw_function_name, BGW_MAXLEN, "pg10046_worker_main");
+		snprintf(worker.bgw_name, BGW_MAXLEN, "pg_10046 trace writer");
+		snprintf(worker.bgw_type, BGW_MAXLEN, "pg_10046 trace writer");
+		worker.bgw_main_arg = (Datum) 0;
+		worker.bgw_notify_pid = 0;
+
+		RegisterBackgroundWorker(&worker);
+	}
+
+	/*
+	 * Install shared memory startup hook.
+	 * This will initialize the ring buffer when shared memory is ready.
+	 */
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = pg10046_shmem_startup;
+
 	/*
 	 * NOTE: Timeout registration is done lazily in setup_sampling_timer()
 	 * to avoid issues with shared_preload_libraries context.
@@ -1034,12 +1632,22 @@ _PG_fini(void)
 		stop_ebpf_trace();
 	}
 
+	/* Unregister from ring buffer before closing trace file */
+	if (my_backend_slot >= 0)
+	{
+		unregister_traced_backend(my_backend_slot);
+		my_backend_slot = -1;
+	}
+
 	/* Close trace file */
 	if (trace_state.trace_fd > 0)
 	{
 		close(trace_state.trace_fd);
 		trace_state.trace_fd = 0;
 	}
+
+	/* Restore shmem startup hook */
+	shmem_startup_hook = prev_shmem_startup_hook;
 
 	/* Restore hooks */
 	planner_hook = prev_planner_hook;
@@ -1269,6 +1877,9 @@ open_trace_file(void)
 	trace_state.query_id = 0;
 	trace_state.call_stack_depth = 0;
 
+	/* Register this backend for ring buffer writes */
+	my_backend_slot = register_traced_backend();
+
 	/* Write trace header */
 	write_trace("# PG_10046 TRACE\n");
 	write_trace("# TRACE_ID: %s\n", trace_state.trace_id);
@@ -1277,6 +1888,10 @@ open_trace_file(void)
 	write_trace("# START_TIME: %lu\n", (unsigned long) trace_state.start_time_ns);
 	write_trace("# SAMPLE_INTERVAL_MS: %d\n", pg10046_sample_interval_ms);
 	write_trace("# EBPF_ENABLED: %s\n", pg10046_ebpf_enabled ? "true" : "false");
+	write_trace("# RING_BUFFER_MB: %d\n", pg10046_ring_buffer_mb);
+	write_trace("# RING_BUFFER_ACTIVE: %s\n",
+				(ring_buffer_ctl && pg_atomic_read_u32(&ring_buffer_ctl->worker_running)) ?
+				"true" : "false");
 	write_trace("#\n");
 
 	/* Start eBPF tracing if enabled */
@@ -1294,7 +1909,10 @@ open_trace_file(void)
 }
 
 /*
- * Write formatted line to trace file
+ * Write formatted line to trace file.
+ *
+ * If ring buffer is available and worker is running, writes go through
+ * the ring buffer for minimal latency. Otherwise falls back to direct write.
  */
 static void
 write_trace(const char *fmt, ...)
@@ -1312,14 +1930,33 @@ write_trace(const char *fmt, ...)
 
 	if (len > 0)
 	{
-		ssize_t ret pg_attribute_unused();
-		ret = write(trace_state.trace_fd, buf, Min(len, (int)sizeof(buf) - 1));
+		len = Min(len, (int)sizeof(buf) - 1);
+
+		/*
+		 * Try ring buffer first if available and worker is running.
+		 * This provides low-latency buffered writes.
+		 */
+		if (ring_buffer_ctl != NULL &&
+			pg_atomic_read_u32(&ring_buffer_ctl->worker_running) &&
+			my_backend_slot >= 0)
+		{
+			if (ring_buffer_write(buf, len))
+				return;  /* Success - event written to ring buffer */
+			/* Fall through to direct write on failure */
+		}
+
+		/* Direct write (fallback or header writes before worker is ready) */
+		{
+			ssize_t ret pg_attribute_unused();
+			ret = write(trace_state.trace_fd, buf, len);
+		}
 	}
 }
 
 /*
  * Write trace without blocking (for use in/near signal context)
- * Uses smaller buffer and non-blocking semantics
+ * Uses smaller buffer and non-blocking semantics.
+ * Ring buffer is safe to use here since it's lock-free.
  */
 static void
 write_trace_nonblock(const char *fmt, ...)
@@ -1337,9 +1974,25 @@ write_trace_nonblock(const char *fmt, ...)
 
 	if (len > 0)
 	{
+		len = Min(len, (int)sizeof(buf) - 1);
+
+		/*
+		 * Try ring buffer first - it's lock-free and safe for signal context.
+		 */
+		if (ring_buffer_ctl != NULL &&
+			pg_atomic_read_u32(&ring_buffer_ctl->worker_running) &&
+			my_backend_slot >= 0)
+		{
+			if (ring_buffer_write(buf, len))
+				return;
+			/* Fall through to direct write on failure */
+		}
+
 		/* Non-blocking write - ignore errors */
-		ssize_t ret pg_attribute_unused();
-		ret = write(trace_state.trace_fd, buf, Min(len, (int)sizeof(buf) - 1));
+		{
+			ssize_t ret pg_attribute_unused();
+			ret = write(trace_state.trace_fd, buf, len);
+		}
 	}
 }
 
