@@ -716,13 +716,19 @@ static WrappedNode *wn_cache_result = NULL;
 /*
  * Local trace buffer for batching writes.
  * Instead of writing each event to ring buffer separately (expensive atomic ops),
- * we accumulate all events in a local buffer and flush once at query end.
- * This dramatically reduces overhead for small queries.
+ * we accumulate all events in a local buffer and flush asynchronously.
+ *
+ * Async strategy: Don't flush at query end. Only flush when:
+ * 1. Buffer is getting full (>75% capacity)
+ * 2. At session end (trace file close)
+ * This eliminates write() syscall overhead from query execution path entirely.
  */
-#define LOCAL_TRACE_BUF_SIZE (128 * 1024)  /* 128KB - enough for most queries */
+#define LOCAL_TRACE_BUF_SIZE (128 * 1024)  /* 128KB - enough for many queries */
+#define LOCAL_TRACE_BUF_FLUSH_THRESHOLD (LOCAL_TRACE_BUF_SIZE * 3 / 4)  /* Flush at 75% */
 static char *local_trace_buf = NULL;
 static int local_trace_buf_pos = 0;
 static bool local_trace_buf_active = false;
+static bool exit_callback_registered = false;
 
 /* Timeout-based sampling state */
 static volatile sig_atomic_t sample_pending = 0;
@@ -736,6 +742,7 @@ static void pg10046_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pg10046_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
                                  uint64 count, bool execute_once);
 static void pg10046_ExecutorEnd(QueryDesc *queryDesc);
+static void pg10046_on_proc_exit(int code, Datum arg);
 static void open_trace_file(void);
 static void write_trace(const char *fmt, ...) pg_attribute_printf(1, 2);
 static void write_trace_direct(const char *fmt, ...) pg_attribute_printf(1, 2);
@@ -1087,9 +1094,9 @@ reset_wrapped_nodes(void)
 }
 
 /*
- * Start buffering trace output.
- * All subsequent write_trace calls will append to local buffer
- * instead of immediately writing to ring buffer.
+ * Start/continue buffering trace output.
+ * All subsequent write_trace calls will append to local buffer.
+ * Does NOT reset buffer - accumulates across queries for async flush.
  */
 static void
 start_trace_buffering(void)
@@ -1100,8 +1107,9 @@ start_trace_buffering(void)
 		MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
 		local_trace_buf = palloc(LOCAL_TRACE_BUF_SIZE);
 		MemoryContextSwitchTo(oldctx);
+		local_trace_buf_pos = 0;
 	}
-	local_trace_buf_pos = 0;
+	/* Don't reset pos - accumulate across queries */
 	local_trace_buf_active = true;
 }
 
@@ -1877,9 +1885,48 @@ _PG_init(void)
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = pg10046_ExecutorEnd;
 
+	/*
+	 * NOTE: Exit callback registration moved to open_trace_file() for lazy
+	 * per-backend registration. This ensures it's registered in the actual
+	 * backend process, not just the postmaster during shared_preload_libraries.
+	 */
+
 #if PG_VERSION_NUM >= 150000
 	MarkGUCPrefixReserved("pg_10046");
 #endif
+}
+
+/*
+ * Cleanup on backend exit - flush buffered traces.
+ * Registered lazily via on_proc_exit() in open_trace_file().
+ */
+static void
+pg10046_on_proc_exit(int code, Datum arg)
+{
+	/*
+	 * Guard: Only do cleanup if this backend actually did tracing.
+	 * Background worker processes (bgwriter, stats collector, etc.) also call
+	 * this callback but never initialized tracing state.
+	 */
+	if (!trace_state.active && local_trace_buf == NULL && trace_state.trace_fd <= 0)
+		return;
+
+	/* Flush any remaining buffered trace data */
+	flush_trace_buffer();
+
+	/* Close trace file */
+	if (trace_state.trace_fd > 0)
+	{
+		close(trace_state.trace_fd);
+		trace_state.trace_fd = 0;
+	}
+
+	/* Unregister from ring buffer */
+	if (my_backend_slot >= 0)
+	{
+		unregister_traced_backend(my_backend_slot);
+		my_backend_slot = -1;
+	}
 }
 
 /*
@@ -1899,20 +1946,6 @@ _PG_fini(void)
 	if (trace_state.ebpf_active)
 	{
 		stop_ebpf_trace();
-	}
-
-	/* Unregister from ring buffer before closing trace file */
-	if (my_backend_slot >= 0)
-	{
-		unregister_traced_backend(my_backend_slot);
-		my_backend_slot = -1;
-	}
-
-	/* Close trace file */
-	if (trace_state.trace_fd > 0)
-	{
-		close(trace_state.trace_fd);
-		trace_state.trace_fd = 0;
 	}
 
 	/* Restore shmem startup hook */
@@ -2147,6 +2180,17 @@ open_trace_file(void)
 	trace_state.call_stack_depth = 0;
 
 	/*
+	 * Register exit callback lazily (per-backend).
+	 * This ensures the callback is registered in the actual backend process,
+	 * not just the postmaster (which may have inherited from shared_preload_libraries).
+	 */
+	if (!exit_callback_registered)
+	{
+		on_proc_exit(pg10046_on_proc_exit, 0);
+		exit_callback_registered = true;
+	}
+
+	/*
 	 * Write trace header DIRECTLY (not through ring buffer).
 	 * This prevents race conditions where SAMPLE events from the timeout
 	 * handler (which also writes directly) could appear before the header.
@@ -2249,19 +2293,30 @@ write_trace(const char *fmt, ...)
 		/*
 		 * Fast path: if local buffering is active, append to local buffer.
 		 * This eliminates per-event ring buffer overhead.
+		 *
+		 * Async flush: When buffer exceeds threshold, flush in background-friendly way.
+		 * This keeps write() syscall out of the critical query execution path.
 		 */
 		if (local_trace_buf_active && local_trace_buf != NULL)
 		{
-			int remaining = LOCAL_TRACE_BUF_SIZE - local_trace_buf_pos;
+			int remaining;
+
+			/* Check if we should flush (buffer getting full) */
+			if (local_trace_buf_pos >= LOCAL_TRACE_BUF_FLUSH_THRESHOLD)
+			{
+				flush_trace_buffer();
+				/* Don't call start_trace_buffering - just keep going */
+			}
+
+			remaining = LOCAL_TRACE_BUF_SIZE - local_trace_buf_pos;
 			if (len < remaining)
 			{
 				memcpy(local_trace_buf + local_trace_buf_pos, buf, len);
 				local_trace_buf_pos += len;
 				return;
 			}
-			/* Buffer full - flush and retry */
+			/* Buffer truly full - flush and retry */
 			flush_trace_buffer();
-			start_trace_buffering();
 			if (len < LOCAL_TRACE_BUF_SIZE)
 			{
 				memcpy(local_trace_buf + local_trace_buf_pos, buf, len);
@@ -3345,6 +3400,13 @@ pg10046_planner(Query *parse, const char *query_string,
 
 		if (trace_state.active)
 		{
+			/*
+			 * Start buffering ALL trace output (planning + execution).
+			 * This ensures consistent write path and avoids mixing
+			 * ring buffer (planning) with local buffer (execution).
+			 */
+			start_trace_buffering();
+
 			trace_state.query_id++;
 			trace_state.plan_start_time = plan_start;
 			trace_state.plan_end_time = plan_end;
@@ -3547,8 +3609,10 @@ pg10046_ExecutorEnd(QueryDesc *queryDesc)
 					trace_state.query_id,
 					elapsed);
 
-		/* Flush all buffered trace output to ring buffer/file */
-		flush_trace_buffer();
+		/* NOTE: Don't flush here - let buffer accumulate across queries.
+		 * Flush happens automatically when buffer reaches 75% capacity.
+		 * This keeps write() syscall out of query execution path.
+		 */
 
 		/* Stop eBPF tracing if active */
 		if (trace_state.ebpf_active)
