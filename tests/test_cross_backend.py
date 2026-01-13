@@ -232,7 +232,7 @@ class TestMultipleSessions(unittest.TestCase):
             control.execute("SELECT trace_10046.disable_trace(%s)", (target2_pid,))
             target1.close()
             target2.close()
-            time.sleep(0.2)
+            time.sleep(0.5)  # Allow time for on_proc_exit flush
 
             # Check both traces exist
             pattern1 = f"{self.harness.config.trace_dir}/pg_10046_{target1_pid}_*.trc"
@@ -280,7 +280,7 @@ class TestMultipleSessions(unittest.TestCase):
             for i, (t, pid) in enumerate(zip(targets, target_pids)):
                 control.execute("SELECT trace_10046.disable_trace(%s)", (pid,))
                 t.close()
-            time.sleep(0.2)
+            time.sleep(0.5)  # Allow time for on_proc_exit flush
 
             # Verify all traces exist
             for i, pid in enumerate(target_pids):
