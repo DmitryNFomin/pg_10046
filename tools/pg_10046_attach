@@ -1,0 +1,835 @@
+#!/usr/bin/env python3
+"""
+pg_10046_attach - Attach to a PostgreSQL backend for tracing
+
+Two modes of operation:
+1. WAIT mode (default): Wait for the NEXT query on the backend
+   - Uses bpftrace to capture at query start
+   - Gets SQL and plan from QueryDesc argument
+   - Best for backends that run repeated queries
+
+2. RUNNING mode (--running): Capture ALREADY-RUNNING query
+   - Reads process memory directly (no bpftrace needed for plan)
+   - Gets plan from: ActivePortal -> Portal -> QueryDesc -> PlanState
+   - Works for any query currently executing
+   - Then starts eBPF tracing for IO/CPU
+
+After capturing the initial query, this tool:
+- Starts eBPF IO tracing via pg_10046d daemon
+- Enables pg_10046 extension for subsequent queries on the same backend
+  (extension knows eBPF is already active and won't restart it)
+
+Usage:
+    pg_10046_attach <pid>            # Wait for next query
+    pg_10046_attach <pid> --running  # Capture currently running query
+    pg_10046_attach --help
+
+Example:
+    # Find long-running query
+    psql -c "SELECT pid, left(query,50) FROM pg_stat_activity WHERE state='active';"
+
+    # Capture plan of ALREADY RUNNING query
+    pg_10046_attach 12345 --running
+
+    # Or wait for NEXT query on this backend
+    pg_10046_attach 12345
+
+    # Specify database connection for extension enable
+    pg_10046_attach 12345 --running -d mydb -U myuser
+"""
+
+import argparse
+import os
+import socket
+import sys
+import subprocess
+import json
+import time
+import signal
+import struct
+from datetime import datetime
+
+DEFAULT_SOCKET = "/var/run/pg_10046.sock"
+DEFAULT_TRACE_DIR = "/tmp"
+DEFAULT_PG_BIN = "/usr/pgsql-13/bin/postgres"
+
+# Node tag mappings for PostgreSQL 13
+PLAN_NODE_TAGS = {
+    10: "Result",
+    11: "ProjectSet",
+    12: "ModifyTable",
+    13: "Append",
+    14: "MergeAppend",
+    15: "RecursiveUnion",
+    16: "BitmapAnd",
+    17: "BitmapOr",
+    18: "Scan",
+    19: "SeqScan",
+    20: "SampleScan",
+    21: "IndexScan",
+    22: "IndexOnlyScan",
+    23: "BitmapIndexScan",
+    24: "BitmapHeapScan",
+    25: "TidScan",
+    26: "SubqueryScan",
+    27: "FunctionScan",
+    28: "ValuesScan",
+    29: "TableFuncScan",
+    30: "CteScan",
+    31: "NamedTuplestoreScan",
+    32: "WorkTableScan",
+    33: "ForeignScan",
+    34: "CustomScan",
+    35: "Join",
+    36: "NestLoop",
+    37: "MergeJoin",
+    38: "HashJoin",
+    39: "Material",
+    40: "Sort",
+    41: "IncrementalSort",
+    42: "Group",
+    43: "Agg",
+    44: "WindowAgg",
+    45: "Unique",
+    46: "Gather",
+    47: "GatherMerge",
+    48: "Hash",
+    49: "SetOp",
+    50: "LockRows",
+    51: "Limit",
+}
+
+
+def check_postgres_process(pid):
+    """Verify PID is a postgres backend process."""
+    try:
+        with open(f"/proc/{pid}/comm", "r") as f:
+            comm = f.read().strip()
+            # Accept postgres, postmaster, or postgres child processes
+            if comm not in ("postgres", "postmaster"):
+                return False, f"PID {pid} is '{comm}', not postgres"
+        # Also verify it's actually a PostgreSQL process by checking cmdline
+        with open(f"/proc/{pid}/cmdline", "r") as f:
+            cmdline = f.read()
+            if "postgres" not in cmdline and "postmaster" not in cmdline:
+                return False, f"PID {pid} does not appear to be PostgreSQL"
+        return True, None
+    except FileNotFoundError:
+        return False, f"PID {pid} does not exist"
+    except PermissionError:
+        return False, f"Permission denied reading PID {pid}"
+
+
+def read_plan_wait_mode(pid, pg_bin, timeout):
+    """
+    Wait for the NEXT query on the backend and capture its plan.
+    Probes standard_ExecutorRun which fires at query execution start.
+    Returns (sql, plan_nodes) where plan_nodes is a list of (depth, tag, ptr, is_right) tuples.
+    """
+
+    bpf_script = f'''
+// Capture on standard_ExecutorRun for next query
+uprobe:{pg_bin}:standard_ExecutorRun /pid == {pid}/ {{
+    $qd = (uint64)arg0;
+    $sql = *(uint64*)($qd + 16);
+    $ps = *(uint64*)($qd + 88);
+
+    printf("SQL:%s\\n", str($sql));
+
+    if ($ps != 0) {{
+        $p1 = *(uint64*)($ps + 8);
+        $t1 = $p1 ? *(uint32*)$p1 : 0;
+        printf("NODE:1,%d,%p\\n", $t1, $ps);
+
+        $l2 = *(uint64*)($ps + 72);
+        if ($l2 > 0x1000000) {{
+            $p2 = *(uint64*)($l2 + 8);
+            $t2 = $p2 ? *(uint32*)$p2 : 0;
+            if ($t2 >= 9 && $t2 <= 55) {{
+                printf("NODE:2,%d,%p\\n", $t2, $l2);
+
+                $l3 = *(uint64*)($l2 + 72);
+                if ($l3 > 0x1000000) {{
+                    $p3 = *(uint64*)($l3 + 8);
+                    $t3 = $p3 ? *(uint32*)$p3 : 0;
+                    if ($t3 >= 9 && $t3 <= 55) {{
+                        printf("NODE:3,%d,%p\\n", $t3, $l3);
+                    }}
+                }}
+
+                $r2 = *(uint64*)($l2 + 80);
+                if ($r2 > 0x1000000) {{
+                    $pr2 = *(uint64*)($r2 + 8);
+                    $tr2 = $pr2 ? *(uint32*)$pr2 : 0;
+                    if ($tr2 >= 9 && $tr2 <= 55) {{
+                        printf("NODE:2R,%d,%p\\n", $tr2, $r2);
+                    }}
+                }}
+            }}
+        }}
+    }}
+
+    printf("END\\n");
+    exit();
+}}
+
+interval:s:{timeout} {{
+    printf("TIMEOUT - no query captured\\n");
+    exit();
+}}
+'''
+
+    return _run_bpftrace_plan_capture(bpf_script, pid, timeout)
+
+
+def read_process_memory(pid, address, size):
+    """Read memory from a process using /proc/<pid>/mem."""
+    try:
+        with open(f"/proc/{pid}/mem", "rb") as mem:
+            mem.seek(address)
+            return mem.read(size)
+    except Exception as e:
+        return None
+
+
+def read_ptr(pid, address):
+    """Read a 64-bit pointer from process memory."""
+    data = read_process_memory(pid, address, 8)
+    if data and len(data) == 8:
+        return struct.unpack("Q", data)[0]
+    return 0
+
+
+def read_u32(pid, address):
+    """Read a 32-bit unsigned int from process memory."""
+    data = read_process_memory(pid, address, 4)
+    if data and len(data) == 4:
+        return struct.unpack("I", data)[0]
+    return 0
+
+
+def read_string(pid, address, max_len=256):
+    """Read a null-terminated string from process memory."""
+    data = read_process_memory(pid, address, max_len)
+    if data:
+        null_pos = data.find(b'\x00')
+        if null_pos >= 0:
+            return data[:null_pos].decode('utf-8', errors='replace')
+    return None
+
+
+def read_i16(pid, address):
+    """Read a 16-bit signed int from process memory."""
+    data = read_process_memory(pid, address, 2)
+    if data and len(data) == 2:
+        return struct.unpack("h", data)[0]
+    return 0
+
+
+def read_u8(pid, address):
+    """Read a byte from process memory."""
+    data = read_process_memory(pid, address, 1)
+    if data and len(data) == 1:
+        return data[0]
+    return 0
+
+
+# PostgreSQL OID -> type name mapping (common types)
+PG_TYPE_NAMES = {
+    16: "bool",
+    20: "int8",
+    21: "int2",
+    23: "int4",
+    25: "text",
+    26: "oid",
+    700: "float4",
+    701: "float8",
+    1042: "bpchar",
+    1043: "varchar",
+    1082: "date",
+    1083: "time",
+    1114: "timestamp",
+    1184: "timestamptz",
+    1700: "numeric",
+    2950: "uuid",
+}
+
+
+def read_bind_variables(pid, portal_ptr):
+    """
+    Read bind variables from Portal->portalParams.
+
+    PostgreSQL 13 offsets (from DWARF):
+    - Portal->portalParams at offset 96 (ParamListInfo pointer)
+    - ParamListInfoData->numParams at offset 56
+    - ParamListInfoData->params at offset 64 (flexible array)
+    - Each ParamExternData is 16 bytes:
+      - +0: value (Datum, 8 bytes)
+      - +8: isnull (bool, 1 byte)
+      - +12: ptype (Oid, 4 bytes)
+
+    Returns list of (param_num, type_oid, type_name, is_null, value_repr)
+    """
+    binds = []
+
+    # Portal->portalParams at offset 96
+    param_list_ptr = read_ptr(pid, portal_ptr + 96)
+
+    if not param_list_ptr or param_list_ptr < 0x1000000:
+        return binds  # No parameters
+
+    # ParamListInfoData->numParams at offset 56
+    num_params = read_u32(pid, param_list_ptr + 56)
+
+    if num_params == 0 or num_params > 1000:  # Sanity check
+        return binds
+
+    # ParamListInfoData->params at offset 64 (flexible array)
+    params_base = param_list_ptr + 64
+
+    for i in range(num_params):
+        # Each ParamExternData is 16 bytes
+        param_addr = params_base + (i * 16)
+
+        # Read ParamExternData fields
+        value_datum = read_ptr(pid, param_addr + 0)   # Datum (8 bytes)
+        is_null = read_u8(pid, param_addr + 8)        # bool
+        ptype = read_u32(pid, param_addr + 12)        # Oid
+
+        type_name = PG_TYPE_NAMES.get(ptype, f"oid:{ptype}")
+
+        # Try to interpret the value based on type
+        value_repr = None
+        if is_null:
+            value_repr = "NULL"
+        elif ptype in (20,):  # int8
+            value_repr = str(struct.unpack("q", struct.pack("Q", value_datum))[0])
+        elif ptype in (21,):  # int2
+            value_repr = str(value_datum & 0xFFFF)
+        elif ptype in (23, 26):  # int4, oid
+            value_repr = str(value_datum & 0xFFFFFFFF)
+        elif ptype == 16:  # bool
+            value_repr = "true" if value_datum else "false"
+        elif ptype in (700,):  # float4
+            # float4 is passed by value, stored in lower 32 bits
+            value_repr = str(struct.unpack("f", struct.pack("I", value_datum & 0xFFFFFFFF))[0])
+        elif ptype in (701,):  # float8
+            value_repr = str(struct.unpack("d", struct.pack("Q", value_datum))[0])
+        elif ptype in (25, 1042, 1043):  # text, bpchar, varchar - passed by reference
+            # value_datum is a pointer to varlena structure
+            # varlena: first 4 bytes are header (length info), then data
+            if value_datum > 0x1000000:
+                # Read varlena header
+                header = read_u32(pid, value_datum)
+                # Check if it's a short varlena (1-byte header) or long (4-byte)
+                if header & 0x01:  # Short varlena (VARSIZE_SHORT)
+                    # Length stored in upper 7 bits of first byte
+                    length = ((header & 0xFE) >> 1) - 1  # -1 for header byte
+                    text_bytes = read_process_memory(pid, value_datum + 1, min(length, 256))
+                else:  # Long varlena (4-byte header)
+                    # Length is header >> 2, includes the 4-byte header
+                    total_len = header >> 2
+                    length = total_len - 4  # subtract header size
+                    text_bytes = read_process_memory(pid, value_datum + 4, min(length, 256))
+                if text_bytes:
+                    text = text_bytes.decode('utf-8', errors='replace').rstrip('\x00')
+                    value_repr = f"'{text}'"
+                else:
+                    value_repr = "<text>"
+            else:
+                value_repr = "<ptr>"
+        elif ptype == 1700:  # numeric - passed by reference as varlena
+            # Numeric is complex, just show it exists
+            if value_datum > 0x1000000:
+                value_repr = "<numeric>"
+            else:
+                value_repr = f"0x{value_datum:x}"
+        elif ptype in (1082, 1083, 1114, 1184):  # date, time, timestamp, timestamptz
+            # These are passed by value as int64 (microseconds since 2000-01-01)
+            # Just show raw for now
+            value_repr = f"<{type_name}>"
+        else:
+            # For unknown types, show raw hex
+            value_repr = f"0x{value_datum:x}"
+
+        binds.append((i + 1, ptype, type_name, bool(is_null), value_repr))
+
+    return binds
+
+
+def get_symbol_address(pg_bin, symbol_name):
+    """Get the address of a symbol from the postgres binary."""
+    try:
+        result = subprocess.run(
+            ["nm", "-D", pg_bin],
+            capture_output=True,
+            text=True
+        )
+        for line in result.stdout.split('\n'):
+            parts = line.split()
+            if len(parts) >= 3 and parts[2] == symbol_name:
+                return int(parts[0], 16)
+    except Exception:
+        pass
+    return None
+
+
+def read_plan_from_running_query(pid, pg_bin):
+    """
+    Read execution plan from an already-running query by reading process memory.
+
+    Reads ActivePortal -> Portal -> QueryDesc -> PlanState -> Plan tree
+    Also reads bind variables from Portal->portalParams
+
+    Returns (sql, plan_nodes, binds, error) where:
+    - plan_nodes is a list of (depth, tag, ptr, is_right) tuples
+    - binds is a list of (param_num, type_oid, type_name, is_null, value_repr) tuples
+    """
+    import struct
+
+    # Get ActivePortal address from symbol table
+    # ActivePortal is a global variable pointing to current portal
+    active_portal_addr = get_symbol_address(pg_bin, "ActivePortal")
+
+    if not active_portal_addr:
+        # Fallback: known address for PG13 (from our earlier investigation)
+        active_portal_addr = 0xc55480
+        print(f"      Using hardcoded ActivePortal address: 0x{active_portal_addr:x}", file=sys.stderr)
+
+    # Need to read from the process's address space
+    # The symbol address is a virtual address in the binary
+    # We need to find the actual runtime address by reading /proc/pid/maps
+
+    runtime_addr = None
+    try:
+        with open(f"/proc/{pid}/maps", "r") as maps:
+            for line in maps:
+                if "postgres" in line and " r-xp " in line:
+                    # Found the main executable mapping
+                    parts = line.split()
+                    base_addr = int(parts[0].split('-')[0], 16)
+                    # The symbol address from nm is relative to 0
+                    # For position-independent executables, we need the load address
+                    # But postgres is usually not PIE, so the address is absolute
+                    break
+    except Exception:
+        pass
+
+    # For non-PIE executables, the symbol address from nm is the runtime address
+    runtime_addr = active_portal_addr
+
+    # Read ActivePortal pointer
+    portal_ptr = read_ptr(pid, runtime_addr)
+
+    if not portal_ptr or portal_ptr < 0x1000000:
+        return None, [], [], "Could not read ActivePortal (no active query?)"
+
+    # Portal structure offsets (PostgreSQL 13):
+    # - sourceText: offset 48
+    # - portalParams: offset 96
+    # - queryDesc: offset 136
+
+    # Read sourceText pointer
+    source_text_ptr = read_ptr(pid, portal_ptr + 48)
+    sql = None
+    if source_text_ptr and source_text_ptr > 0x1000000:
+        sql = read_string(pid, source_text_ptr, 1024)
+
+    # Read bind variables from Portal->portalParams
+    binds = read_bind_variables(pid, portal_ptr)
+
+    # Read queryDesc pointer - offset 136 from DWARF
+    querydesc_ptr = read_ptr(pid, portal_ptr + 136)
+
+    if not querydesc_ptr or querydesc_ptr < 0x1000000:
+        return sql, [], binds, "Could not read QueryDesc"
+
+    # QueryDesc->planstate at offset 88
+    planstate_ptr = read_ptr(pid, querydesc_ptr + 88)
+
+    if not planstate_ptr or planstate_ptr < 0x1000000:
+        return sql, [], binds, "Could not read PlanState"
+
+    # Now traverse the plan tree
+    nodes = []
+
+    def traverse_plan(ps_ptr, depth):
+        if not ps_ptr or ps_ptr < 0x1000000 or depth > 10:
+            return
+
+        # PlanState->plan at offset 8
+        plan_ptr = read_ptr(pid, ps_ptr + 8)
+        if plan_ptr and plan_ptr > 0x1000000:
+            # Plan->type (NodeTag) at offset 0
+            node_tag = read_u32(pid, plan_ptr)
+            if 9 <= node_tag <= 55:  # Valid plan node tags
+                nodes.append((depth, node_tag, hex(ps_ptr), False))
+
+                # PlanState->lefttree at offset 72
+                left_ptr = read_ptr(pid, ps_ptr + 72)
+                traverse_plan(left_ptr, depth + 1)
+
+                # PlanState->righttree at offset 80
+                right_ptr = read_ptr(pid, ps_ptr + 80)
+                if right_ptr and right_ptr > 0x1000000:
+                    # Mark as right child
+                    traverse_plan(right_ptr, depth + 1)
+
+    traverse_plan(planstate_ptr, 1)
+
+    return sql, nodes, binds, None
+
+
+def _run_bpftrace_plan_capture(bpf_script, pid, timeout):
+    """Helper to run bpftrace and parse plan output."""
+    script_path = f"/tmp/pg_10046_read_plan_{pid}.bt"
+    with open(script_path, "w") as f:
+        f.write(bpf_script)
+
+    try:
+        result = subprocess.run(
+            ["sudo", "bpftrace", script_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5
+        )
+
+        output = result.stdout
+        sql = None
+        nodes = []
+
+        for line in output.split('\n'):
+            line = line.strip()
+            if line.startswith("SQL:"):
+                sql = line[4:]
+            elif line.startswith("NODE:"):
+                parts = line[5:].split(',')
+                if len(parts) >= 3:
+                    depth_str = parts[0]
+                    tag = int(parts[1])
+                    ptr = parts[2]
+                    if depth_str.endswith('R'):
+                        depth = int(depth_str[:-1])
+                        is_right = True
+                    else:
+                        depth = int(depth_str)
+                        is_right = False
+                    nodes.append((depth, tag, ptr, is_right))
+
+        return sql, nodes
+
+    except subprocess.TimeoutExpired:
+        return None, []
+    except Exception as e:
+        print(f"Error reading plan: {e}", file=sys.stderr)
+        return None, []
+    finally:
+        if os.path.exists(script_path):
+            os.remove(script_path)
+
+
+def generate_trace_events(pid, sql, nodes, trace_file, io_probe_mode=False, binds=None):
+    """Generate trace events in pg_10046 format."""
+
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    trace_id = f"{pid}_{timestamp}"
+
+    with open(trace_file, "w") as f:
+        # Header
+        f.write("# PG_10046 TRACE (LATE ATTACH)\n")
+        f.write(f"# TRACE_ID: {trace_id}\n")
+        f.write(f"# PID: {pid}\n")
+        f.write(f"# ATTACH_TIME: {datetime.now().isoformat()}\n")
+        if io_probe_mode:
+            f.write("# MODE: MEMORY_READ (plan read from running query)\n")
+        else:
+            f.write("# MODE: WAIT (captured at query start)\n")
+        f.write("#\n")
+
+        ts = int(time.time() * 1000000)
+
+        # Write SQL
+        sql_text = sql if sql else "[SQL not captured]"
+        f.write(f"QUERY_START,{ts},1,sql={sql_text}\n")
+
+        # Write bind variables
+        if binds:
+            for param_num, type_oid, type_name, is_null, value_repr in binds:
+                f.write(f"BIND,{ts},{param_num},{type_name},{value_repr}\n")
+
+        # Plan
+        f.write("PLAN_START\n")
+        if nodes:
+            node_id = 1
+            for depth, tag, ptr, is_right in nodes:
+                node_name = PLAN_NODE_TAGS.get(tag, f"Unknown({tag})")
+                parent_id = 0 if depth == 1 else node_id - 1  # Simplified parent tracking
+                f.write(f"PLAN,{node_id},{parent_id},{depth},{node_name},0,0.00,\n")
+                node_id += 1
+        else:
+            f.write("# No plan nodes captured\n")
+        f.write("PLAN_END\n")
+
+        # Node mappings
+        if nodes:
+            for i, (depth, tag, ptr, is_right) in enumerate(nodes, 1):
+                node_name = PLAN_NODE_TAGS.get(tag, f"Unknown({tag})")
+                parent_ptr = "(nil)" if depth == 1 else nodes[0][2]  # Simplified
+                f.write(f"NODE_MAP,{ptr},{parent_ptr},{node_name},{i},\n")
+
+        f.write(f"EXEC_START,{ts},1\n")
+
+    return trace_id
+
+
+def send_daemon_command(socket_path, command):
+    """Send command to pg_10046 daemon."""
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(socket_path)
+        sock.send(command.encode())
+        response = sock.recv(1024).decode()
+        sock.close()
+        return True, response
+    except FileNotFoundError:
+        return False, f"Daemon socket not found: {socket_path}"
+    except ConnectionRefusedError:
+        return False, "Daemon not running"
+    except Exception as e:
+        return False, str(e)
+
+
+def enable_extension_trace(target_pid, dbname, user, host, port, ebpf_active=True):
+    """
+    Enable pg_10046 extension trace for the target backend.
+
+    Calls pg_10046.enable_trace_ebpf() if eBPF is already active (CLI started it),
+    or pg_10046.enable_trace() if extension should start eBPF itself.
+
+    Returns (success, message)
+    """
+    # Build psql command
+    psql_cmd = ["psql"]
+
+    if host:
+        psql_cmd.extend(["-h", host])
+    psql_cmd.extend(["-p", str(port)])
+    psql_cmd.extend(["-U", user])
+    psql_cmd.extend(["-d", dbname])
+    psql_cmd.extend(["-t", "-A"])  # Tuples only, unaligned output
+
+    # Choose function based on whether eBPF is already active
+    if ebpf_active:
+        sql = f"SELECT trace_10046.enable_trace_ebpf({target_pid});"
+    else:
+        sql = f"SELECT trace_10046.enable_trace({target_pid});"
+
+    psql_cmd.extend(["-c", sql])
+
+    try:
+        result = subprocess.run(
+            psql_cmd,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        if result.returncode == 0:
+            output = result.stdout.strip()
+            if output == "t":
+                return True, "Extension trace enabled for subsequent queries"
+            else:
+                return False, f"Function returned: {output}"
+        else:
+            stderr = result.stderr.strip()
+            # Check for common errors
+            if "does not exist" in stderr:
+                return False, "pg_10046 extension not loaded (function not found)"
+            elif "permission denied" in stderr:
+                return False, "Permission denied (need superuser?)"
+            elif "connection refused" in stderr or "could not connect" in stderr:
+                return False, "Could not connect to PostgreSQL"
+            else:
+                return False, stderr or "Unknown error"
+
+    except subprocess.TimeoutExpired:
+        return False, "Timeout connecting to PostgreSQL"
+    except FileNotFoundError:
+        return False, "psql not found in PATH"
+    except Exception as e:
+        return False, str(e)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Attach to a PostgreSQL backend for tracing",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Capture plan of ALREADY RUNNING query
+    pg_10046_attach 12345 --running
+
+    # Find active queries first
+    psql -c "SELECT pid, left(query,50) FROM pg_stat_activity WHERE state='active';"
+
+    # Wait for NEXT query on this backend
+    pg_10046_attach 12345
+
+Note:
+    --running: Reads plan directly from process memory (works for any running query)
+    Default: Uses bpftrace to capture at query start (waits for next query)
+        """
+    )
+
+    parser.add_argument("pid", type=int, help="PostgreSQL backend PID")
+    parser.add_argument("--running", action="store_true",
+                        help="Capture already-running query (reads plan from memory)")
+    parser.add_argument("--timeout", type=int, default=10,
+                        help="Timeout in seconds (default: 10)")
+    parser.add_argument("--socket", default=DEFAULT_SOCKET,
+                        help=f"Daemon socket path (default: {DEFAULT_SOCKET})")
+    parser.add_argument("--trace-dir", default=DEFAULT_TRACE_DIR,
+                        help=f"Trace directory (default: {DEFAULT_TRACE_DIR})")
+    parser.add_argument("--pg-bin", default=DEFAULT_PG_BIN,
+                        help=f"Path to postgres binary (default: {DEFAULT_PG_BIN})")
+    parser.add_argument("--no-daemon", action="store_true",
+                        help="Don't start IO tracing via daemon, just read plan")
+    parser.add_argument("--dbname", "-d", default="postgres",
+                        help="Database name for enabling extension trace (default: postgres)")
+    parser.add_argument("--user", "-U", default="postgres",
+                        help="Database user (default: postgres)")
+    parser.add_argument("--host", "-h", default=None,
+                        help="Database host (default: local socket)")
+    parser.add_argument("--port", "-p", default="5432",
+                        help="Database port (default: 5432)")
+    parser.add_argument("--no-extension", action="store_true",
+                        help="Don't enable extension for subsequent queries")
+
+    args = parser.parse_args()
+
+    mode = "Running" if args.running else "Wait"
+    print(f"pg_10046_attach - Attaching to PostgreSQL backend PID {args.pid}")
+    print(f"Mode: {mode} (timeout: {args.timeout}s)")
+    print()
+
+    # Verify process
+    ok, err = check_postgres_process(args.pid)
+    if not ok:
+        print(f"Error: {err}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.running:
+        print(f"[1/4] Reading plan from running query...")
+        print("      (Reading process memory: ActivePortal -> QueryDesc -> PlanState)")
+
+        sql, nodes, binds, error = read_plan_from_running_query(args.pid, args.pg_bin)
+
+        if error:
+            print(f"      Warning: {error}", file=sys.stderr)
+
+        if not sql and not nodes:
+            print("       Could not read plan. Query may have finished.", file=sys.stderr)
+            sys.exit(1)
+
+        if sql:
+            print(f"      SQL: {sql[:60]}{'...' if len(sql) > 60 else ''}")
+
+        if binds:
+            print(f"      Bind variables: {len(binds)}")
+            for param_num, type_oid, type_name, is_null, value_repr in binds:
+                print(f"        $${param_num} ({type_name}): {value_repr}")
+        else:
+            print("      Bind variables: (none)")
+
+        if nodes:
+            print(f"      Plan nodes: {len(nodes)}")
+            print()
+            print("      Plan tree:")
+            for depth, tag, ptr, is_right in nodes:
+                node_name = PLAN_NODE_TAGS.get(tag, f"Unknown({tag})")
+                indent = "        " + "  " * (depth - 1)
+                print(f"{indent}-> {node_name}")
+        else:
+            print("      (No plan nodes captured)")
+
+    else:
+        print(f"[1/4] Waiting for next query...")
+        print("      (Will capture when a new query starts on this backend)")
+        sql, nodes = read_plan_wait_mode(args.pid, args.pg_bin, args.timeout)
+        binds = []  # Wait mode doesn't capture binds from bpftrace (yet)
+
+        if not sql:
+            print("       Timeout: No query started.", file=sys.stderr)
+            print("       Try --io-probe for already-running queries.", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"      Query: {sql[:60]}{'...' if len(sql) > 60 else ''}")
+        print(f"      Plan nodes: {len(nodes)}")
+
+        # Show plan tree
+        if nodes:
+            print()
+            print("      Plan tree:")
+            for depth, tag, ptr, is_right in nodes:
+                node_name = PLAN_NODE_TAGS.get(tag, f"Unknown({tag})")
+                indent = "        " + "  " * (depth - 1)
+                marker = "(R)" if is_right else ""
+                print(f"{indent}-> {node_name} {marker}")
+
+    # Generate trace file
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    trace_file = f"{args.trace_dir}/pg_10046_{args.pid}_{timestamp}.trc"
+
+    print()
+    print(f"[2/4] Writing trace file...")
+    if args.running:
+        # For already-running queries, we read the plan from memory
+        trace_id = generate_trace_events(args.pid, sql, nodes, trace_file,
+                                         io_probe_mode=True, binds=binds)
+    else:
+        trace_id = generate_trace_events(args.pid, sql, nodes, trace_file)
+    print(f"      Trace file: {trace_file}")
+
+    # Start IO tracing via daemon
+    ebpf_started = False
+    if not args.no_daemon:
+        print()
+        print(f"[3/4] Starting IO tracing...")
+        ok, response = send_daemon_command(args.socket, f"ATTACH {args.pid} {trace_id}")
+        if ok:
+            print(f"      IO tracing active")
+            ebpf_started = True
+        else:
+            print(f"      Warning: {response}")
+            print(f"      IO tracing not started, but plan trace is available")
+
+    # Enable extension for subsequent queries
+    if not args.no_extension:
+        print()
+        print(f"[4/4] Enabling extension for subsequent queries...")
+        ok, msg = enable_extension_trace(
+            args.pid,
+            args.dbname,
+            args.user,
+            args.host,
+            args.port,
+            ebpf_active=ebpf_started
+        )
+        if ok:
+            print(f"      {msg}")
+            if ebpf_started:
+                print(f"      (eBPF already active - extension will NOT start it again)")
+        else:
+            print(f"      Warning: {msg}")
+            print(f"      Subsequent queries will NOT be traced by extension")
+
+    print()
+    print("Done. Trace file ready for analysis:")
+    print(f"  {trace_file}")
+    if ebpf_started and not args.no_extension:
+        print()
+        print("Subsequent queries on this backend will also be traced by the extension.")
+
+
+if __name__ == "__main__":
+    main()

@@ -55,6 +55,8 @@
 #include "utils/rel.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_am.h"
+#include "utils/portal.h"  /* For Portal structure - late-attach support */
+#include "tcop/pquery.h"   /* For ActivePortal global variable */
 
 PG_MODULE_MAGIC;
 
@@ -65,6 +67,9 @@ void		_PG_fini(void);
 static void write_trace(const char *fmt, ...) pg_attribute_printf(1, 2);
 static void start_ebpf_trace(void);
 static void stop_ebpf_trace(void);
+
+/* Forward declaration for late-attach (running query capture) */
+static void capture_running_query(void);
 
 /* Saved hook values */
 static planner_hook_type prev_planner_hook = NULL;
@@ -124,6 +129,17 @@ typedef struct TracedBackend
 } TracedBackend;
 
 /*
+ * Cross-backend trace request structure.
+ * Used when one session wants to enable tracing on another backend.
+ */
+typedef struct TraceRequest
+{
+	pg_atomic_uint32 requested;      /* 1 = trace requested, 0 = no request */
+	pg_atomic_uint32 ebpf_active;    /* 1 = eBPF already started externally */
+	int              requester_pid;  /* PID of requesting session (for logging) */
+} TraceRequest;
+
+/*
  * Shared memory control structure for the ring buffer.
  */
 typedef struct RingBufferCtl
@@ -143,6 +159,14 @@ typedef struct RingBufferCtl
 	/* Worker state */
 	pg_atomic_uint32 worker_running;
 	Latch      *worker_latch;    /* For signaling the worker */
+
+	/*
+	 * Cross-backend trace requests.
+	 * Indexed by backend ID (not PID). Use GetBackendIdFromPid() to find slot.
+	 * When a session calls pg_10046.enable_trace(pid), it sets the flag here.
+	 * Target backend checks this at query start and enables tracing.
+	 */
+	TraceRequest trace_requests[MAX_TRACED_BACKENDS];
 
 	/* The actual ring buffer follows this structure in memory */
 } RingBufferCtl;
@@ -291,6 +315,11 @@ pg10046_shmem_startup(void)
 			ring_buffer_ctl->backends[i].start_time_ns = 0;
 			pg_atomic_init_u64(&ring_buffer_ctl->backends[i].events_written, 0);
 			pg_atomic_init_u64(&ring_buffer_ctl->backends[i].events_dropped, 0);
+
+			/* Initialize trace request slots */
+			pg_atomic_init_u32(&ring_buffer_ctl->trace_requests[i].requested, 0);
+			pg_atomic_init_u32(&ring_buffer_ctl->trace_requests[i].ebpf_active, 0);
+			ring_buffer_ctl->trace_requests[i].requester_pid = 0;
 		}
 
 		/* Point to the ring buffer slots (after control structure) */
@@ -690,6 +719,7 @@ static void pg10046_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 static void pg10046_ExecutorEnd(QueryDesc *queryDesc);
 static void open_trace_file(void);
 static void write_trace(const char *fmt, ...) pg_attribute_printf(1, 2);
+static void write_trace_direct(const char *fmt, ...) pg_attribute_printf(1, 2);
 static void write_trace_nonblock(const char *fmt, ...) pg_attribute_printf(1, 2);
 static void emit_bind_variables(ParamListInfo params);
 static void emit_plan_tree(Plan *plan, int parent_id, int depth, PlannedStmt *pstmt);
@@ -1465,6 +1495,167 @@ wrap_planstate_nodes(PlanState *planstate)
 	}
 }
 
+/* ============================================================================
+ * SQL Functions for cross-backend trace control
+ * ============================================================================
+ */
+
+/*
+ * Find backend slot index by PID.
+ * Returns -1 if not found.
+ */
+static int
+find_backend_slot_by_pid(int target_pid)
+{
+	int i;
+
+	if (ring_buffer_ctl == NULL)
+		return -1;
+
+	/*
+	 * Look through registered backends first - but we also need to handle
+	 * backends that haven't started tracing yet. Use a simple linear search
+	 * through all possible slots.
+	 */
+	for (i = 0; i < MAX_TRACED_BACKENDS; i++)
+	{
+		if (ring_buffer_ctl->backends[i].pid == (uint32) target_pid)
+			return i;
+	}
+
+	/*
+	 * Backend not found in registered list - return an available slot
+	 * based on PID modulo. This ensures consistent slot for a given PID.
+	 */
+	return target_pid % MAX_TRACED_BACKENDS;
+}
+
+/*
+ * pg_10046_enable_trace(target_pid int) - Enable tracing on another backend.
+ *
+ * Sets a flag in shared memory that the target backend will check at the
+ * start of its next query. The target will then enable tracing.
+ *
+ * Returns true if the request was registered, false on error.
+ */
+PG_FUNCTION_INFO_V1(pg_10046_enable_trace);
+Datum
+pg_10046_enable_trace(PG_FUNCTION_ARGS)
+{
+	int			target_pid = PG_GETARG_INT32(0);
+	int			slot;
+
+	if (ring_buffer_ctl == NULL)
+	{
+		ereport(WARNING,
+				(errmsg("pg_10046: shared memory not initialized")));
+		PG_RETURN_BOOL(false);
+	}
+
+	/* Validate target PID exists (basic check) */
+	if (target_pid <= 0)
+	{
+		ereport(WARNING,
+				(errmsg("pg_10046: invalid target PID %d", target_pid)));
+		PG_RETURN_BOOL(false);
+	}
+
+	/* Find slot for this backend */
+	slot = find_backend_slot_by_pid(target_pid);
+	if (slot < 0)
+	{
+		ereport(WARNING,
+				(errmsg("pg_10046: could not find slot for PID %d", target_pid)));
+		PG_RETURN_BOOL(false);
+	}
+
+	/* Set the trace request flag */
+	ring_buffer_ctl->trace_requests[slot].requester_pid = MyProcPid;
+	pg_atomic_write_u32(&ring_buffer_ctl->trace_requests[slot].requested, 1);
+
+	elog(LOG, "pg_10046: trace requested for PID %d by PID %d (slot %d)",
+		 target_pid, MyProcPid, slot);
+
+	PG_RETURN_BOOL(true);
+}
+
+/*
+ * pg_10046_enable_trace_ebpf(target_pid int) - Enable tracing with eBPF flag.
+ *
+ * Same as pg_10046_enable_trace but also sets ebpf_active flag to indicate
+ * that eBPF tracing was already started externally (e.g., by CLI tool).
+ * This prevents the extension from trying to start eBPF again.
+ */
+PG_FUNCTION_INFO_V1(pg_10046_enable_trace_ebpf);
+Datum
+pg_10046_enable_trace_ebpf(PG_FUNCTION_ARGS)
+{
+	int			target_pid = PG_GETARG_INT32(0);
+	int			slot;
+
+	if (ring_buffer_ctl == NULL)
+	{
+		ereport(WARNING,
+				(errmsg("pg_10046: shared memory not initialized")));
+		PG_RETURN_BOOL(false);
+	}
+
+	if (target_pid <= 0)
+	{
+		ereport(WARNING,
+				(errmsg("pg_10046: invalid target PID %d", target_pid)));
+		PG_RETURN_BOOL(false);
+	}
+
+	slot = find_backend_slot_by_pid(target_pid);
+	if (slot < 0)
+	{
+		ereport(WARNING,
+				(errmsg("pg_10046: could not find slot for PID %d", target_pid)));
+		PG_RETURN_BOOL(false);
+	}
+
+	/* Set both flags - trace requested AND eBPF already active */
+	ring_buffer_ctl->trace_requests[slot].requester_pid = MyProcPid;
+	pg_atomic_write_u32(&ring_buffer_ctl->trace_requests[slot].ebpf_active, 1);
+	pg_atomic_write_u32(&ring_buffer_ctl->trace_requests[slot].requested, 1);
+
+	elog(LOG, "pg_10046: trace+eBPF requested for PID %d by PID %d (slot %d)",
+		 target_pid, MyProcPid, slot);
+
+	PG_RETURN_BOOL(true);
+}
+
+/*
+ * pg_10046_disable_trace(target_pid int) - Disable tracing on another backend.
+ *
+ * Note: This only clears the request flag. If tracing is already active,
+ * it will continue until the session disables it or ends.
+ */
+PG_FUNCTION_INFO_V1(pg_10046_disable_trace);
+Datum
+pg_10046_disable_trace(PG_FUNCTION_ARGS)
+{
+	int			target_pid = PG_GETARG_INT32(0);
+	int			slot;
+
+	if (ring_buffer_ctl == NULL)
+		PG_RETURN_BOOL(false);
+
+	slot = find_backend_slot_by_pid(target_pid);
+	if (slot < 0)
+		PG_RETURN_BOOL(false);
+
+	/* Clear the trace request flags */
+	pg_atomic_write_u32(&ring_buffer_ctl->trace_requests[slot].requested, 0);
+	pg_atomic_write_u32(&ring_buffer_ctl->trace_requests[slot].ebpf_active, 0);
+	ring_buffer_ctl->trace_requests[slot].requester_pid = 0;
+
+	elog(LOG, "pg_10046: trace request cleared for PID %d", target_pid);
+
+	PG_RETURN_BOOL(true);
+}
+
 /*
  * Module load callback
  */
@@ -1877,34 +2068,78 @@ open_trace_file(void)
 	trace_state.query_id = 0;
 	trace_state.call_stack_depth = 0;
 
-	/* Register this backend for ring buffer writes */
-	my_backend_slot = register_traced_backend();
-
-	/* Write trace header */
-	write_trace("# PG_10046 TRACE\n");
-	write_trace("# TRACE_ID: %s\n", trace_state.trace_id);
-	write_trace("# TRACE_UUID: %s\n", trace_state.trace_uuid);
-	write_trace("# PID: %d\n", MyProcPid);
-	write_trace("# START_TIME: %lu\n", (unsigned long) trace_state.start_time_ns);
-	write_trace("# SAMPLE_INTERVAL_MS: %d\n", pg10046_sample_interval_ms);
-	write_trace("# EBPF_ENABLED: %s\n", pg10046_ebpf_enabled ? "true" : "false");
-	write_trace("# RING_BUFFER_MB: %d\n", pg10046_ring_buffer_mb);
-	write_trace("# RING_BUFFER_ACTIVE: %s\n",
+	/*
+	 * Write trace header DIRECTLY (not through ring buffer).
+	 * This prevents race conditions where SAMPLE events from the timeout
+	 * handler (which also writes directly) could appear before the header.
+	 */
+	write_trace_direct("# PG_10046 TRACE\n");
+	write_trace_direct("# TRACE_ID: %s\n", trace_state.trace_id);
+	write_trace_direct("# TRACE_UUID: %s\n", trace_state.trace_uuid);
+	write_trace_direct("# PID: %d\n", MyProcPid);
+	write_trace_direct("# START_TIME: %lu\n", (unsigned long) trace_state.start_time_ns);
+	write_trace_direct("# SAMPLE_INTERVAL_MS: %d\n", pg10046_sample_interval_ms);
+	write_trace_direct("# EBPF_ENABLED: %s\n", pg10046_ebpf_enabled ? "true" : "false");
+	write_trace_direct("# RING_BUFFER_MB: %d\n", pg10046_ring_buffer_mb);
+	write_trace_direct("# RING_BUFFER_ACTIVE: %s\n",
 				(ring_buffer_ctl && pg_atomic_read_u32(&ring_buffer_ctl->worker_running)) ?
 				"true" : "false");
-	write_trace("#\n");
+	write_trace_direct("#\n");
 
-	/* Start eBPF tracing if enabled */
-	if (pg10046_ebpf_enabled)
+	/* Start eBPF tracing if enabled (and not already started externally) */
+	if (trace_state.ebpf_active)
+	{
+		/* eBPF was already started externally (e.g., by pg_10046_attach CLI) */
+		write_trace_direct("# eBPF tracing: EXTERNAL (started by CLI tool)\n");
+		write_trace_direct("#\n");
+	}
+	else if (pg10046_ebpf_enabled)
 	{
 		start_ebpf_trace();
 	}
 	else
 	{
-		write_trace("# To collect IO events manually, start eBPF tracer:\n");
-		write_trace("#   pg_10046_ebpf.sh start %d %s\n", MyProcPid, trace_state.trace_uuid);
-		write_trace("# eBPF trace file: pg_10046_io_%s.trc\n", trace_state.trace_id);
-		write_trace("#\n");
+		write_trace_direct("# To collect IO events manually, start eBPF tracer:\n");
+		write_trace_direct("#   pg_10046_ebpf.sh start %d %s\n", MyProcPid, trace_state.trace_uuid);
+		write_trace_direct("# eBPF trace file: pg_10046_io_%s.trc\n", trace_state.trace_id);
+		write_trace_direct("#\n");
+	}
+
+	/* Now register this backend for ring buffer writes */
+	my_backend_slot = register_traced_backend();
+
+	/*
+	 * LATE-ATTACH: Check if there's an already-running query.
+	 * If so, capture its SQL, binds, plan, and NODE_MAP.
+	 * This enables tracing to be enabled mid-query and still get
+	 * full visibility into the running execution.
+	 */
+	capture_running_query();
+}
+
+/*
+ * Write formatted line to trace file - DIRECT write (bypasses ring buffer).
+ * Used for header writes that must appear before any ring buffer events.
+ */
+static void
+write_trace_direct(const char *fmt, ...)
+{
+	va_list		args;
+	char		buf[8192];
+	int			len;
+
+	if (trace_state.trace_fd <= 0)
+		return;
+
+	va_start(args, fmt);
+	len = vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+
+	if (len > 0)
+	{
+		ssize_t ret pg_attribute_unused();
+		len = Min(len, (int)sizeof(buf) - 1);
+		ret = write(trace_state.trace_fd, buf, len);
 	}
 }
 
@@ -2595,6 +2830,100 @@ emit_node_mapping(PlanState *planstate, PlanState *parent, int depth)
 	}
 }
 
+/*
+ * LATE-ATTACH: Capture SQL, binds, plan, and NODE_MAP from an already-running query.
+ *
+ * This is called when tracing is enabled (e.g., SET pg_10046.enabled = true)
+ * and there's already a query executing in this backend. ActivePortal points
+ * to the currently executing portal, which contains all the query information.
+ *
+ * This allows "attaching" to a running query mid-execution, similar to how
+ * Oracle's 10046 trace can be enabled at any time.
+ */
+static void
+capture_running_query(void)
+{
+	Portal		portal;
+	QueryDesc  *queryDesc;
+	const char *sql;
+	int64		now;
+
+	/*
+	 * Check if there's an active portal with a running query.
+	 * ActivePortal is a global variable pointing to the currently executing portal.
+	 */
+	portal = ActivePortal;
+	if (portal == NULL)
+		return;
+
+	/* Check if the portal has a queryDesc (i.e., query is actually running) */
+	queryDesc = portal->queryDesc;
+	if (queryDesc == NULL)
+		return;
+
+	/* Check if we have a planstate (execution has started) */
+	if (queryDesc->planstate == NULL)
+		return;
+
+	/*
+	 * We found a running query! Emit its information.
+	 * Note: This query was already being executed before tracing was enabled,
+	 * so we mark it specially in the trace output.
+	 */
+	write_trace("# LATE-ATTACH: Captured already-running query\n");
+
+	now = get_trace_timestamp();
+	trace_state.query_id++;
+
+	/* Get SQL text - prefer portal's sourceText, fall back to queryDesc */
+	sql = portal->sourceText;
+	if (sql == NULL || sql[0] == '\0')
+		sql = queryDesc->sourceText;
+	if (sql == NULL)
+		sql = "(unknown)";
+
+	write_trace("QUERY_START,%ld,%lu,sql=%s\n",
+				now, trace_state.query_id, sql);
+
+	/* Emit bind variables from portal params */
+	if (portal->portalParams)
+	{
+		emit_bind_variables(portal->portalParams);
+		trace_state.bound_params = portal->portalParams;
+	}
+
+	/* Emit plan tree if we have access to it */
+	if (queryDesc->plannedstmt && queryDesc->plannedstmt->planTree)
+	{
+		plan_node_id_counter = 0;
+		write_trace("PLAN_START\n");
+		emit_plan_tree(queryDesc->plannedstmt->planTree, 0, 1, queryDesc->plannedstmt);
+		write_trace("PLAN_END\n");
+	}
+
+	/* Record execution start (approximation - actual start was earlier) */
+	trace_state.exec_start_time = now;
+	trace_state.nesting_level++;
+	trace_state.current_planstate = queryDesc->planstate;
+	trace_state.call_stack_depth = 0;
+
+	write_trace("EXEC_START,%ld,%lu\n", now, trace_state.query_id);
+
+	/* Emit NODE_MAP for eBPF attribution */
+	emit_node_mapping(queryDesc->planstate, NULL, 1);
+
+	/* Wrap nodes to track execution (if not already wrapped) */
+	wrap_planstate_nodes(queryDesc->planstate);
+
+	/* Start sampling timer for wait event capture */
+	setup_sampling_timer();
+
+	fsync(trace_state.trace_fd);
+
+	elog(LOG, "pg_10046: late-attach captured running query (pid=%d, query_id=%lu)",
+		 MyProcPid, trace_state.query_id);
+}
+
 /* Global node ID counter for stats (reset per query, matches plan IDs) */
 static int stat_node_id_counter = 0;
 
@@ -2853,6 +3182,48 @@ emit_node_specific_info(PlanState *planstate, int node_id)
 }
 
 /*
+ * Check if another session requested tracing for this backend.
+ * If so, enable tracing. Called at the start of planner hook.
+ */
+static void
+check_trace_request(void)
+{
+	int slot;
+
+	if (ring_buffer_ctl == NULL)
+		return;
+
+	/* Find our slot based on our PID */
+	slot = MyProcPid % MAX_TRACED_BACKENDS;
+
+	/* Check if tracing was requested for us */
+	if (pg_atomic_read_u32(&ring_buffer_ctl->trace_requests[slot].requested))
+	{
+		/* Clear the request flag */
+		pg_atomic_write_u32(&ring_buffer_ctl->trace_requests[slot].requested, 0);
+
+		/* Check if eBPF was already started externally */
+		if (pg_atomic_read_u32(&ring_buffer_ctl->trace_requests[slot].ebpf_active))
+		{
+			/* Mark that eBPF is already running - don't start again */
+			trace_state.ebpf_active = true;
+			pg_atomic_write_u32(&ring_buffer_ctl->trace_requests[slot].ebpf_active, 0);
+			elog(LOG, "pg_10046: trace enabled by request (eBPF already active)");
+		}
+		else
+		{
+			elog(LOG, "pg_10046: trace enabled by request from PID %d",
+				 ring_buffer_ctl->trace_requests[slot].requester_pid);
+		}
+
+		ring_buffer_ctl->trace_requests[slot].requester_pid = 0;
+
+		/* Enable tracing for this backend */
+		pg10046_enabled = true;
+	}
+}
+
+/*
  * Planner hook
  */
 static PlannedStmt *
@@ -2862,6 +3233,9 @@ pg10046_planner(Query *parse, const char *query_string,
 	PlannedStmt *result;
 	int64 plan_start = 0;
 	int64 plan_end = 0;
+
+	/* Check if another session requested tracing for us */
+	check_trace_request();
 
 	if (pg10046_enabled)
 		plan_start = get_trace_timestamp();
