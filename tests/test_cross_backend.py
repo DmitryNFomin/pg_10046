@@ -54,12 +54,13 @@ class TestCrossBackendEnable(unittest.TestCase):
         control = self.harness.new_connection()
 
         self.harness.cleanup_traces()
+        target_pid = target.pid  # Save PID before close
 
         try:
             # Enable trace on target from control
             result = control.execute(
                 "SELECT trace_10046.enable_trace(%s)",
-                (target.pid,)
+                (target_pid,)
             )
             self.assertIsNone(result.error, f"enable_trace failed: {result.error}")
             self.assertTrue(result.rows[0]['enable_trace'])
@@ -67,9 +68,12 @@ class TestCrossBackendEnable(unittest.TestCase):
             # Run query on target - should be traced
             target.execute("SELECT * FROM generate_series(1, 100)")
 
-            # Wait for trace file
-            time.sleep(0.5)
-            pattern = f"{self.config.trace_dir}/pg_10046_{target.pid}_*.trc"
+            # Close target to flush async buffer, then check trace
+            control.execute("SELECT trace_10046.disable_trace(%s)", (target_pid,))
+            target.close()
+            time.sleep(0.2)
+
+            pattern = f"{self.config.trace_dir}/pg_10046_{target_pid}_*.trc"
             files = glob.glob(pattern)
             self.assertTrue(len(files) > 0, "Trace file should exist")
 
@@ -78,8 +82,8 @@ class TestCrossBackendEnable(unittest.TestCase):
             assert_query_count_at_least(trace, 1)
 
         finally:
-            control.execute("SELECT trace_10046.disable_trace(%s)", (target.pid,))
-            target.close()
+            if not target._closed:
+                target.close()
             control.close()
 
     def test_enable_trace_ebpf(self):
@@ -88,12 +92,13 @@ class TestCrossBackendEnable(unittest.TestCase):
         control = self.harness.new_connection()
 
         self.harness.cleanup_traces()
+        target_pid = target.pid  # Save PID before close
 
         try:
             # Enable trace with eBPF flag
             result = control.execute(
                 "SELECT trace_10046.enable_trace_ebpf(%s)",
-                (target.pid,)
+                (target_pid,)
             )
             self.assertIsNone(result.error)
             self.assertTrue(result.rows[0]['enable_trace_ebpf'])
@@ -101,8 +106,12 @@ class TestCrossBackendEnable(unittest.TestCase):
             # Run query
             target.execute("SELECT 1 + 1 AS result")
 
-            time.sleep(0.5)
-            pattern = f"{self.config.trace_dir}/pg_10046_{target.pid}_*.trc"
+            # Close target to flush async buffer, then check trace
+            control.execute("SELECT trace_10046.disable_trace(%s)", (target_pid,))
+            target.close()
+            time.sleep(0.2)
+
+            pattern = f"{self.config.trace_dir}/pg_10046_{target_pid}_*.trc"
             files = glob.glob(pattern)
             self.assertTrue(len(files) > 0)
 
@@ -110,8 +119,8 @@ class TestCrossBackendEnable(unittest.TestCase):
             assert_query_count_at_least(trace, 1)
 
         finally:
-            control.execute("SELECT trace_10046.disable_trace(%s)", (target.pid,))
-            target.close()
+            if not target._closed:
+                target.close()
             control.close()
 
     def test_disable_trace_clears_request(self):
@@ -206,21 +215,28 @@ class TestMultipleSessions(unittest.TestCase):
         control = self.harness.new_connection()
 
         self.harness.cleanup_traces()
+        target1_pid = target1.pid  # Save PIDs before close
+        target2_pid = target2.pid
 
         try:
             # Enable trace on both
-            control.execute("SELECT trace_10046.enable_trace(%s)", (target1.pid,))
-            control.execute("SELECT trace_10046.enable_trace(%s)", (target2.pid,))
+            control.execute("SELECT trace_10046.enable_trace(%s)", (target1_pid,))
+            control.execute("SELECT trace_10046.enable_trace(%s)", (target2_pid,))
 
             # Run queries on both
             target1.execute("SELECT 'target1_query' AS source")
             target2.execute("SELECT 'target2_query' AS source")
 
-            time.sleep(0.5)
+            # Close targets to flush async buffers
+            control.execute("SELECT trace_10046.disable_trace(%s)", (target1_pid,))
+            control.execute("SELECT trace_10046.disable_trace(%s)", (target2_pid,))
+            target1.close()
+            target2.close()
+            time.sleep(0.2)
 
             # Check both traces exist
-            pattern1 = f"{self.harness.config.trace_dir}/pg_10046_{target1.pid}_*.trc"
-            pattern2 = f"{self.harness.config.trace_dir}/pg_10046_{target2.pid}_*.trc"
+            pattern1 = f"{self.harness.config.trace_dir}/pg_10046_{target1_pid}_*.trc"
+            pattern2 = f"{self.harness.config.trace_dir}/pg_10046_{target2_pid}_*.trc"
 
             files1 = glob.glob(pattern1)
             files2 = glob.glob(pattern2)
@@ -237,10 +253,10 @@ class TestMultipleSessions(unittest.TestCase):
             assert_query_captured(trace2, r"target2_query")
 
         finally:
-            control.execute("SELECT trace_10046.disable_trace(%s)", (target1.pid,))
-            control.execute("SELECT trace_10046.disable_trace(%s)", (target2.pid,))
-            target1.close()
-            target2.close()
+            if not target1._closed:
+                target1.close()
+            if not target2._closed:
+                target2.close()
             control.close()
 
     def test_five_concurrent_traces(self):
@@ -249,21 +265,26 @@ class TestMultipleSessions(unittest.TestCase):
         control = self.harness.new_connection()
 
         self.harness.cleanup_traces()
+        target_pids = [t.pid for t in targets]  # Save PIDs before close
 
         try:
             # Enable trace on all
-            for t in targets:
-                control.execute("SELECT trace_10046.enable_trace(%s)", (t.pid,))
+            for pid in target_pids:
+                control.execute("SELECT trace_10046.enable_trace(%s)", (pid,))
 
             # Run queries on all
             for i, t in enumerate(targets):
                 t.execute(f"SELECT {i} AS session_num")
 
-            time.sleep(0.5)
+            # Close all targets to flush async buffers
+            for i, (t, pid) in enumerate(zip(targets, target_pids)):
+                control.execute("SELECT trace_10046.disable_trace(%s)", (pid,))
+                t.close()
+            time.sleep(0.2)
 
             # Verify all traces exist
-            for i, t in enumerate(targets):
-                pattern = f"{self.harness.config.trace_dir}/pg_10046_{t.pid}_*.trc"
+            for i, pid in enumerate(target_pids):
+                pattern = f"{self.harness.config.trace_dir}/pg_10046_{pid}_*.trc"
                 files = glob.glob(pattern)
                 self.assertTrue(len(files) > 0, f"Target {i} trace should exist")
 
@@ -272,8 +293,8 @@ class TestMultipleSessions(unittest.TestCase):
 
         finally:
             for t in targets:
-                control.execute("SELECT trace_10046.disable_trace(%s)", (t.pid,))
-                t.close()
+                if not t._closed:
+                    t.close()
             control.close()
 
 
@@ -294,10 +315,11 @@ class TestTraceTiming(unittest.TestCase):
         control = self.harness.new_connection()
 
         self.harness.cleanup_traces()
+        target_pid = target.pid  # Save PID before close
 
         try:
             # Enable first
-            control.execute("SELECT trace_10046.enable_trace(%s)", (target.pid,))
+            control.execute("SELECT trace_10046.enable_trace(%s)", (target_pid,))
 
             # Wait a bit
             time.sleep(0.1)
@@ -305,8 +327,12 @@ class TestTraceTiming(unittest.TestCase):
             # Then run query
             target.execute("SELECT 'after enable' AS timing")
 
-            time.sleep(0.3)
-            pattern = f"{self.harness.config.trace_dir}/pg_10046_{target.pid}_*.trc"
+            # Close target to flush async buffer
+            control.execute("SELECT trace_10046.disable_trace(%s)", (target_pid,))
+            target.close()
+            time.sleep(0.2)
+
+            pattern = f"{self.harness.config.trace_dir}/pg_10046_{target_pid}_*.trc"
             files = glob.glob(pattern)
             self.assertTrue(len(files) > 0)
 
@@ -314,8 +340,8 @@ class TestTraceTiming(unittest.TestCase):
             assert_query_captured(trace, r"after enable")
 
         finally:
-            control.execute("SELECT trace_10046.disable_trace(%s)", (target.pid,))
-            target.close()
+            if not target._closed:
+                target.close()
             control.close()
 
     def test_multiple_queries_single_trace(self):
@@ -329,7 +355,8 @@ class TestTraceTiming(unittest.TestCase):
             trace = parse_trace(trace_info.path)
 
             # All three queries should be captured
-            assert_query_count(trace, 3)
+            # May include internal queries like pg_backend_pid() so use >=
+            self.assertGreaterEqual(len(trace.queries), 3)
             assert_query_captured(trace, r"first")
             assert_query_captured(trace, r"second")
             assert_query_captured(trace, r"third")

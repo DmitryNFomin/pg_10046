@@ -223,8 +223,9 @@ class TestSimpleQueries(unittest.TestCase):
             # Check required header fields
             assert_header_present(trace, ['TRACE_ID', 'PID', 'START_TIME'])
 
-            # Verify PID matches session PID
-            self.assertEqual(int(trace.header.get('PID', 0)), session.conn.pid)
+            # Verify PID matches session PID (use saved PID since conn may be closed)
+            expected_pid = session._saved_pid or session.conn.pid
+            self.assertEqual(int(trace.header.get('PID', 0)), expected_pid)
 
     def test_statistics_present(self):
         """Test that execution statistics are captured."""
