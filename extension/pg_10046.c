@@ -1199,7 +1199,7 @@ emit_node_end_for_wrapped(WrappedNode *wn, int64 end_time, const char *reason)
 	if (instr)
 	{
 		write_trace("NODE_END,%ld,%p,%s,tuples=%.0f,blks_hit=%ld,blks_read=%ld,time_us=%ld,%s%s%s\n",
-					end_time, (void *)instr, node_name,
+					end_time, (void *)node, node_name,
 					instr->tuplecount,
 					instr->bufusage.shared_blks_hit,
 					instr->bufusage.shared_blks_read,
@@ -1210,8 +1210,9 @@ emit_node_end_for_wrapped(WrappedNode *wn, int64 end_time, const char *reason)
 	}
 	else
 	{
-		write_trace("NODE_END,%ld,%p,%s,tuples=0,blks_hit=0,blks_read=0,time_us=%ld,%s%s%s\n",
-					end_time, (void *)instr, node_name,
+		write_trace("NODE_END,%ld,%p,%s,tuples=%ld,blks_hit=0,blks_read=0,time_us=%ld,%s%s%s\n",
+					end_time, (void *)node, node_name,
+					wn->tuples_returned,
 					elapsed,
 					target,
 					reason ? ",reason=" : "",
@@ -3564,7 +3565,7 @@ emit_early_stop_node_ends(void)
 			if (instr)
 			{
 				write_trace("NODE_END,%ld,%p,%s,tuples=%.0f,blks_hit=%ld,blks_read=%ld,time_us=%ld,%s,reason=EARLY_STOP\n",
-							wn->last_call_time, (void *)instr, node_name,
+							wn->last_call_time, (void *)node, node_name,
 							instr->tuplecount,
 							instr->bufusage.shared_blks_hit,
 							instr->bufusage.shared_blks_read,
@@ -3573,8 +3574,9 @@ emit_early_stop_node_ends(void)
 			}
 			else
 			{
-				write_trace("NODE_END,%ld,%p,%s,tuples=0,blks_hit=0,blks_read=0,time_us=%ld,%s,reason=EARLY_STOP\n",
-							wn->last_call_time, (void *)instr, node_name,
+				write_trace("NODE_END,%ld,%p,%s,tuples=%ld,blks_hit=0,blks_read=0,time_us=%ld,%s,reason=EARLY_STOP\n",
+							wn->last_call_time, (void *)node, node_name,
+							wn->tuples_returned,
 							elapsed,
 							target);
 			}
