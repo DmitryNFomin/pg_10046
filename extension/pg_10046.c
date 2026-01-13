@@ -713,6 +713,17 @@ static int num_wrapped_nodes = 0;
 static PlanState *wn_cache_node = NULL;
 static WrappedNode *wn_cache_result = NULL;
 
+/*
+ * Local trace buffer for batching writes.
+ * Instead of writing each event to ring buffer separately (expensive atomic ops),
+ * we accumulate all events in a local buffer and flush once at query end.
+ * This dramatically reduces overhead for small queries.
+ */
+#define LOCAL_TRACE_BUF_SIZE (128 * 1024)  /* 128KB - enough for most queries */
+static char *local_trace_buf = NULL;
+static int local_trace_buf_pos = 0;
+static bool local_trace_buf_active = false;
+
 /* Timeout-based sampling state */
 static volatile sig_atomic_t sample_pending = 0;
 static TimeoutId pg10046_timeout_id = USER_TIMEOUT;
@@ -1073,6 +1084,50 @@ reset_wrapped_nodes(void)
 	/* Invalidate inline cache */
 	wn_cache_node = NULL;
 	wn_cache_result = NULL;
+}
+
+/*
+ * Start buffering trace output.
+ * All subsequent write_trace calls will append to local buffer
+ * instead of immediately writing to ring buffer.
+ */
+static void
+start_trace_buffering(void)
+{
+	if (local_trace_buf == NULL)
+	{
+		/* Allocate in TopMemoryContext so it persists across queries */
+		MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
+		local_trace_buf = palloc(LOCAL_TRACE_BUF_SIZE);
+		MemoryContextSwitchTo(oldctx);
+	}
+	local_trace_buf_pos = 0;
+	local_trace_buf_active = true;
+}
+
+/*
+ * Flush buffered trace output directly to file.
+ * Called at query end to write all accumulated events in one shot.
+ *
+ * IMPORTANT: We always use direct write() here, bypassing ring buffer.
+ * The ring buffer's per-event atomic operations are the main source of
+ * overhead - by buffering locally and writing once, we eliminate that.
+ */
+static void
+flush_trace_buffer(void)
+{
+	ssize_t ret pg_attribute_unused();
+
+	if (!local_trace_buf_active || local_trace_buf == NULL || local_trace_buf_pos == 0)
+		return;
+
+	local_trace_buf_active = false;  /* Prevent recursion */
+
+	/* Single direct write - bypasses expensive ring buffer operations */
+	if (trace_state.trace_fd > 0)
+		ret = write(trace_state.trace_fd, local_trace_buf, local_trace_buf_pos);
+
+	local_trace_buf_pos = 0;
 }
 
 /*
@@ -2169,8 +2224,9 @@ write_trace_direct(const char *fmt, ...)
 /*
  * Write formatted line to trace file.
  *
- * If ring buffer is available and worker is running, writes go through
- * the ring buffer for minimal latency. Otherwise falls back to direct write.
+ * If local buffering is active, appends to local buffer (flushed at query end).
+ * Otherwise, if ring buffer is available, writes through ring buffer.
+ * Falls back to direct write as last resort.
  */
 static void
 write_trace(const char *fmt, ...)
@@ -2191,8 +2247,32 @@ write_trace(const char *fmt, ...)
 		len = Min(len, (int)sizeof(buf) - 1);
 
 		/*
-		 * Try ring buffer first if available and worker is running.
-		 * This provides low-latency buffered writes.
+		 * Fast path: if local buffering is active, append to local buffer.
+		 * This eliminates per-event ring buffer overhead.
+		 */
+		if (local_trace_buf_active && local_trace_buf != NULL)
+		{
+			int remaining = LOCAL_TRACE_BUF_SIZE - local_trace_buf_pos;
+			if (len < remaining)
+			{
+				memcpy(local_trace_buf + local_trace_buf_pos, buf, len);
+				local_trace_buf_pos += len;
+				return;
+			}
+			/* Buffer full - flush and retry */
+			flush_trace_buffer();
+			start_trace_buffering();
+			if (len < LOCAL_TRACE_BUF_SIZE)
+			{
+				memcpy(local_trace_buf + local_trace_buf_pos, buf, len);
+				local_trace_buf_pos += len;
+				return;
+			}
+			/* Event too large for buffer, fall through to direct write */
+		}
+
+		/*
+		 * Try ring buffer if available and worker is running.
 		 */
 		if (ring_buffer_ctl != NULL &&
 			pg_atomic_read_u32(&ring_buffer_ctl->worker_running) &&
@@ -2203,7 +2283,7 @@ write_trace(const char *fmt, ...)
 			/* Fall through to direct write on failure */
 		}
 
-		/* Direct write (fallback or header writes before worker is ready) */
+		/* Direct write (fallback) */
 		{
 			ssize_t ret pg_attribute_unused();
 			ret = write(trace_state.trace_fd, buf, len);
@@ -3355,6 +3435,11 @@ pg10046_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 		trace_state.current_planstate = queryDesc->planstate;
 		trace_state.call_stack_depth = 0;
 
+		/* Buffer all trace output during execution, flush once at query end.
+		 * This bypasses expensive ring buffer operations (6 atomics + SetLatch per event).
+		 */
+		start_trace_buffering();
+
 		write_trace("EXEC_START,%ld,%lu\n",
 					trace_state.exec_start_time,
 					trace_state.query_id);
@@ -3461,6 +3546,9 @@ pg10046_ExecutorEnd(QueryDesc *queryDesc)
 					end_time,
 					trace_state.query_id,
 					elapsed);
+
+		/* Flush all buffered trace output to ring buffer/file */
+		flush_trace_buffer();
 
 		/* Stop eBPF tracing if active */
 		if (trace_state.ebpf_active)
