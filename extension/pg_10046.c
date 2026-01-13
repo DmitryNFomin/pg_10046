@@ -709,6 +709,10 @@ typedef struct WrappedNode {
 static WrappedNode wrapped_nodes[MAX_WRAPPED_NODES];
 static int num_wrapped_nodes = 0;
 
+/* Inline cache for find_wrapped_node - huge win since same node is looked up repeatedly */
+static PlanState *wn_cache_node = NULL;
+static WrappedNode *wn_cache_result = NULL;
+
 /* Timeout-based sampling state */
 static volatile sig_atomic_t sample_pending = 0;
 static TimeoutId pg10046_timeout_id = USER_TIMEOUT;
@@ -981,16 +985,18 @@ cancel_sampling_timer(void)
  *
  * Signal safety: Write array entry BEFORE incrementing depth.
  * This ensures the signal handler always sees consistent data.
+ * Using pg_write_barrier() (lighter than pg_memory_barrier()) since
+ * we only need write ordering - signal handler does reads.
  */
-static void
+static inline void
 push_call_stack(PlanState *node)
 {
 	int depth = trace_state.call_stack_depth;
 	if (depth < MAX_NODE_STACK_DEPTH)
 	{
 		trace_state.call_stack[depth] = node;
-		/* Memory barrier to ensure array write is visible before depth update */
-		pg_memory_barrier();
+		/* Write barrier to ensure array write is visible before depth update */
+		pg_write_barrier();
 		trace_state.call_stack_depth = depth + 1;
 	}
 }
@@ -1001,7 +1007,7 @@ push_call_stack(PlanState *node)
  * Signal safety: Just decrement depth. The old array entry doesn't matter
  * because signal handler checks depth first.
  */
-static void
+static inline void
 pop_call_stack(void)
 {
 	if (trace_state.call_stack_depth > 0)
@@ -1064,21 +1070,42 @@ static void
 reset_wrapped_nodes(void)
 {
 	num_wrapped_nodes = 0;
+	/* Invalidate inline cache */
+	wn_cache_node = NULL;
+	wn_cache_result = NULL;
 }
 
 /*
  * Find wrapped node entry for a given PlanState
  * Returns pointer to WrappedNode or NULL if not found
+ *
+ * Uses inline cache for fast repeated lookups (common case: same node
+ * called thousands of times for scan operations)
  */
-static WrappedNode *
+static inline WrappedNode *
 find_wrapped_node(PlanState *node)
 {
 	int i;
+
+	/* Fast path: cache hit (same node as last lookup) */
+	if (node == wn_cache_node)
+		return wn_cache_result;
+
+	/* Slow path: linear search */
 	for (i = 0; i < num_wrapped_nodes; i++)
 	{
 		if (wrapped_nodes[i].node == node)
-			return &wrapped_nodes[i];
+		{
+			/* Update cache */
+			wn_cache_node = node;
+			wn_cache_result = &wrapped_nodes[i];
+			return wn_cache_result;
+		}
 	}
+
+	/* Not found - cache the miss too to avoid repeated searches */
+	wn_cache_node = node;
+	wn_cache_result = NULL;
 	return NULL;
 }
 
