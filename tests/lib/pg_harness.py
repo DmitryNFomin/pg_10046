@@ -104,6 +104,7 @@ class PgConnection:
         self.pid: Optional[int] = None
         self._trace_enabled = False
         self._trace_start_time: Optional[float] = None
+        self._closed = False
 
     def connect(self):
         """Establish connection to PostgreSQL."""
@@ -124,6 +125,7 @@ class PgConnection:
             self.conn.close()
             self.conn = None
             self.pid = None
+        self._closed = True
 
     def execute(self, sql: str, params: tuple = None) -> QueryResult:
         """Execute a query and return results."""
@@ -204,9 +206,14 @@ class TracedSession:
         self._trace_info: Optional[TraceInfo] = None
         self._queries_executed: List[QueryResult] = []
         self._explains: List[ExplainPlan] = []
+        self._saved_pid: Optional[int] = None  # Saved PID for after connection close
 
     def enable_trace(self, ebpf_active: bool = False):
         """Enable tracing on this session from the control connection."""
+        # Save PID immediately when enabling trace
+        if self._saved_pid is None and self.conn.pid:
+            self._saved_pid = self.conn.pid
+
         func = "enable_trace_ebpf" if ebpf_active else "enable_trace"
         result = self.control_conn.execute(
             f"SELECT trace_10046.{func}(%s)",
@@ -224,6 +231,9 @@ class TracedSession:
 
     def execute(self, sql: str, params: tuple = None, with_explain: bool = True) -> QueryResult:
         """Execute a query (tracing should capture it)."""
+        # Save PID before any operations (in case connection closes later)
+        if self._saved_pid is None and self.conn.pid:
+            self._saved_pid = self.conn.pid
         result = self.conn.execute(sql, params)
         self._queries_executed.append(result)
 
@@ -242,7 +252,12 @@ class TracedSession:
 
     def wait_for_trace(self, timeout_sec: float = 5.0) -> Optional[TraceInfo]:
         """Wait for trace file to appear and return its info."""
-        pattern = f"{self.config.trace_dir}/pg_10046_{self.conn.pid}_*.trc"
+        # Use saved PID if connection is closed
+        pid = self._saved_pid or self.conn.pid
+        if not pid:
+            return None
+
+        pattern = f"{self.config.trace_dir}/pg_10046_{pid}_*.trc"
         start = time.time()
 
         while time.time() - start < timeout_sec:
@@ -252,7 +267,7 @@ class TracedSession:
                 latest = max(files, key=os.path.getmtime)
                 self._trace_info = TraceInfo(
                     path=latest,
-                    pid=self.conn.pid,
+                    pid=pid,
                     trace_id=Path(latest).stem,
                     size_bytes=os.path.getsize(latest),
                     exists=True
@@ -263,8 +278,28 @@ class TracedSession:
         return None
 
     def get_trace(self) -> Optional[TraceInfo]:
-        """Get trace file info (waits if necessary)."""
+        """Get trace file info (waits if necessary).
+
+        NOTE: With async buffering, trace data is flushed when the connection
+        closes. This method closes the connection to ensure data is flushed
+        before reading the trace file.
+        """
+        # Close connection to trigger buffer flush (async buffering)
+        if self.conn and not self.conn._closed:
+            self.conn.close()
+            self.conn._closed = True
+            time.sleep(0.1)  # Give time for on_proc_exit to flush
+
         if self._trace_info:
+            # Re-read file size after flush
+            if os.path.exists(self._trace_info.path):
+                self._trace_info = TraceInfo(
+                    path=self._trace_info.path,
+                    pid=self._trace_info.pid,
+                    trace_id=self._trace_info.trace_id,
+                    size_bytes=os.path.getsize(self._trace_info.path),
+                    exists=True
+                )
             return self._trace_info
         return self.wait_for_trace()
 
