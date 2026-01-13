@@ -2918,7 +2918,11 @@ capture_running_query(void)
 	/* Start sampling timer for wait event capture */
 	setup_sampling_timer();
 
-	fsync(trace_state.trace_fd);
+	/* Only fsync if NOT using ring buffer (ring buffer worker handles flushing) */
+	if (!(ring_buffer_ctl != NULL &&
+		  pg_atomic_read_u32(&ring_buffer_ctl->worker_running) &&
+		  my_backend_slot >= 0))
+		fsync(trace_state.trace_fd);
 
 	elog(LOG, "pg_10046: late-attach captured running query (pid=%d, query_id=%lu)",
 		 MyProcPid, trace_state.query_id);
@@ -3271,7 +3275,11 @@ pg10046_planner(Query *parse, const char *query_string,
 
 			write_trace("PLAN_TIME,%ld\n", plan_end - plan_start);
 
-			fsync(trace_state.trace_fd);
+			/* Only fsync if NOT using ring buffer */
+			if (!(ring_buffer_ctl != NULL &&
+				  pg_atomic_read_u32(&ring_buffer_ctl->worker_running) &&
+				  my_backend_slot >= 0))
+				fsync(trace_state.trace_fd);
 		}
 	}
 
@@ -3335,7 +3343,11 @@ pg10046_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 		/* Start periodic sampling */
 		setup_sampling_timer();
 
-		fsync(trace_state.trace_fd);
+		/* Only fsync if NOT using ring buffer */
+		if (!(ring_buffer_ctl != NULL &&
+			  pg_atomic_read_u32(&ring_buffer_ctl->worker_running) &&
+			  my_backend_slot >= 0))
+			fsync(trace_state.trace_fd);
 	}
 
 	/* Call original executor */
