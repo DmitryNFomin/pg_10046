@@ -1,5 +1,18 @@
 # pg_10046 test library
-from .trace_validator import TraceParser, TraceValidator, TraceFile, ValidationResult
+from .trace_validator import (
+    TraceParser,
+    TraceValidator,
+    TraceFile,
+    ValidationResult,
+    IOTraceParser,
+    EBPFTraceParser,
+    IOTraceFile,
+    EBPFTraceFile,
+    IOEvent,
+    CPUEvent,
+    parse_io_trace,
+    EventType,
+)
 from .pg_harness import PgHarness, PgConfig, TracedSession
 from .assertions import (
     parse_trace,
@@ -17,6 +30,14 @@ __all__ = [
     'TraceValidator',
     'TraceFile',
     'ValidationResult',
+    'IOTraceParser',
+    'EBPFTraceParser',
+    'IOTraceFile',
+    'EBPFTraceFile',
+    'IOEvent',
+    'CPUEvent',
+    'parse_io_trace',
+    'EventType',
     'PgHarness',
     'PgConfig',
     'TracedSession',

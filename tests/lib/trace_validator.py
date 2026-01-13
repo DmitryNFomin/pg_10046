@@ -43,6 +43,12 @@ class EventType(Enum):
     STAT = "STAT"
     STATS_END = "STATS_END"
     EXEC_END = "EXEC_END"
+    # IO events from eBPF
+    IO_READ = "IO_READ"
+    IO_WRITE = "IO_WRITE"
+    # CPU events from eBPF
+    CPU_OFF = "CPU_OFF"
+    CPU_ON = "CPU_ON"
     UNKNOWN = "UNKNOWN"
 
 
@@ -111,6 +117,87 @@ class ValidationResult:
 
 
 @dataclass
+class IOEvent:
+    """An IO event from eBPF trace."""
+    line_num: int
+    event_type: str  # IO_READ or IO_WRITE
+    timestamp: int
+    pid: int
+    node_ptr: str
+    tablespace: int
+    database: int
+    relation: int
+    fork: int
+    segment: int
+    block: int
+    elapsed_us: int
+    disk: int = 0
+    block_elapsed_us: int = 0
+
+
+@dataclass
+class CPUEvent:
+    """A CPU scheduling event from eBPF trace."""
+    line_num: int
+    event_type: str  # CPU_OFF or CPU_ON
+    timestamp: int
+    pid: int
+    node_ptr: str
+    duration_us: int  # on_cpu_duration for CPU_OFF, off_cpu_duration for CPU_ON
+
+
+@dataclass
+class EBPFTraceFile:
+    """Parsed eBPF trace file (IO and CPU events)."""
+    path: str
+    header: Dict[str, str] = field(default_factory=dict)
+    io_reads: List[IOEvent] = field(default_factory=list)
+    io_writes: List[IOEvent] = field(default_factory=list)
+    cpu_off: List[CPUEvent] = field(default_factory=list)
+    cpu_on: List[CPUEvent] = field(default_factory=list)
+
+    @property
+    def events(self) -> List:
+        """All events (IO + CPU) for backwards compatibility."""
+        return self.io_reads + self.io_writes
+
+    @property
+    def total_read_us(self) -> int:
+        return sum(e.elapsed_us for e in self.io_reads)
+
+    @property
+    def total_write_us(self) -> int:
+        return sum(e.elapsed_us for e in self.io_writes)
+
+    @property
+    def total_blocks_read(self) -> int:
+        return len(self.io_reads)
+
+    @property
+    def total_blocks_written(self) -> int:
+        return len(self.io_writes)
+
+    @property
+    def total_on_cpu_us(self) -> int:
+        """Total time spent on CPU (from CPU_OFF events)."""
+        return sum(e.duration_us for e in self.cpu_off)
+
+    @property
+    def total_off_cpu_us(self) -> int:
+        """Total time spent off CPU (from CPU_ON events)."""
+        return sum(e.duration_us for e in self.cpu_on)
+
+    @property
+    def cpu_switches(self) -> int:
+        """Number of CPU context switches."""
+        return len(self.cpu_off)
+
+
+# Alias for backwards compatibility
+IOTraceFile = EBPFTraceFile
+
+
+@dataclass
 class TraceFile:
     """Parsed trace file structure."""
     path: str
@@ -121,6 +208,9 @@ class TraceFile:
     # Quick access indexes
     node_starts: Dict[str, List[TraceEvent]] = field(default_factory=dict)  # ptr -> events
     node_ends: Dict[str, List[TraceEvent]] = field(default_factory=dict)    # ptr -> events
+
+    # IO trace (if available)
+    io_trace: Optional[IOTraceFile] = None
 
 
 class TraceParser:
@@ -579,6 +669,123 @@ def compare_traces(trace1_path: str, trace2_path: str) -> Dict[str, Any]:
                 )
 
     return differences
+
+
+class IOTraceParser:
+    """Parse pg_10046 eBPF trace files (IO and CPU events)."""
+
+    # IO event pattern: pid,timestamp,IO_READ|IO_WRITE,node_ptr,spc,db,rel,fork,seg,blk,ela_us,disk,blk_ela_us
+    IO_PATTERN = re.compile(
+        r'^(\d+),(\d+),(IO_READ|IO_WRITE),([^,]+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)$'
+    )
+    # Simpler format from pg_10046_ebpf.sh: timestamp,IO_READ|IO_WRITE,spc,db,rel,fork,seg,blk,ela_us
+    IO_PATTERN_SIMPLE = re.compile(
+        r'^(\d+),(IO_READ|IO_WRITE),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)$'
+    )
+    # CPU event pattern: pid,timestamp,CPU_OFF|CPU_ON,node_ptr,duration_us
+    CPU_PATTERN = re.compile(
+        r'^(\d+),(\d+),(CPU_OFF|CPU_ON),([^,]+),(\d+)$'
+    )
+    HEADER_PATTERN = re.compile(r'^#\s*(\w+):\s*(.+)$')
+
+    def __init__(self, path: str):
+        self.path = path
+        self.trace = EBPFTraceFile(path=path)
+
+    def parse(self) -> EBPFTraceFile:
+        """Parse the eBPF trace file and return structured data."""
+        with open(self.path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.rstrip('\n')
+                if not line:
+                    continue
+
+                # Header comments
+                if line.startswith('#'):
+                    match = self.HEADER_PATTERN.match(line)
+                    if match:
+                        key, value = match.groups()
+                        self.trace.header[key] = value
+                    continue
+
+                # Try CPU event pattern
+                match = self.CPU_PATTERN.match(line)
+                if match:
+                    groups = match.groups()
+                    event = CPUEvent(
+                        line_num=line_num,
+                        event_type=groups[2],
+                        timestamp=int(groups[1]),
+                        pid=int(groups[0]),
+                        node_ptr=groups[3],
+                        duration_us=int(groups[4]),
+                    )
+                    if event.event_type == 'CPU_OFF':
+                        self.trace.cpu_off.append(event)
+                    else:
+                        self.trace.cpu_on.append(event)
+                    continue
+
+                # Try full IO format
+                match = self.IO_PATTERN.match(line)
+                if match:
+                    groups = match.groups()
+                    event = IOEvent(
+                        line_num=line_num,
+                        event_type=groups[2],
+                        timestamp=int(groups[1]),
+                        pid=int(groups[0]),
+                        node_ptr=groups[3],
+                        tablespace=int(groups[4]),
+                        database=int(groups[5]),
+                        relation=int(groups[6]),
+                        fork=int(groups[7]),
+                        segment=int(groups[8]),
+                        block=int(groups[9]),
+                        elapsed_us=int(groups[10]),
+                        disk=int(groups[11]),
+                        block_elapsed_us=int(groups[12]),
+                    )
+                    if event.event_type == 'IO_READ':
+                        self.trace.io_reads.append(event)
+                    else:
+                        self.trace.io_writes.append(event)
+                    continue
+
+                # Try simple IO format
+                match = self.IO_PATTERN_SIMPLE.match(line)
+                if match:
+                    groups = match.groups()
+                    event = IOEvent(
+                        line_num=line_num,
+                        event_type=groups[1],
+                        timestamp=int(groups[0]),
+                        pid=0,  # Not in simple format
+                        node_ptr='',  # Not in simple format
+                        tablespace=int(groups[2]),
+                        database=int(groups[3]),
+                        relation=int(groups[4]),
+                        fork=int(groups[5]),
+                        segment=int(groups[6]),
+                        block=int(groups[7]),
+                        elapsed_us=int(groups[8]),
+                    )
+                    if event.event_type == 'IO_READ':
+                        self.trace.io_reads.append(event)
+                    else:
+                        self.trace.io_writes.append(event)
+
+        return self.trace
+
+
+# Alias for backwards compatibility
+EBPFTraceParser = IOTraceParser
+
+
+def parse_io_trace(path: str) -> IOTraceFile:
+    """Convenience function to parse an IO trace file."""
+    parser = IOTraceParser(path)
+    return parser.parse()
 
 
 if __name__ == "__main__":
