@@ -80,6 +80,7 @@ static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 /* GUC variables */
 static bool pg10046_enabled = false;
 static bool pg10046_ebpf_enabled = false;  /* Also start eBPF IO tracing */
+static bool pg10046_track_buffers = false; /* Track per-node buffer stats (EXPENSIVE - adds ~500% overhead!) */
 static char *pg10046_trace_dir = NULL;
 static char *pg10046_daemon_socket = NULL;  /* Default: /var/run/pg_10046.sock */
 static int pg10046_sample_interval_ms = 10;  /* Sample every 10ms by default */
@@ -231,7 +232,7 @@ typedef struct TraceState
 	 * signal handler always reads consistent data.
 	 */
 	volatile int	call_stack_depth;
-	Instrumentation *call_stack[MAX_NODE_STACK_DEPTH];
+	PlanState *call_stack[MAX_NODE_STACK_DEPTH];  /* Changed from Instrumentation* */
 
 	/* For signal handler - pointer to current planstate root */
 	PlanState  *current_planstate;
@@ -700,6 +701,9 @@ typedef struct WrappedNode {
 	int64       start_time;         /* Timestamp when node started */
 	int64       last_call_time;     /* Timestamp of last ExecProcNode call (for early-stop) */
 	double      last_progress_tuples; /* Tuple count at last PROGRESS emit */
+
+	/* Self-tracked stats (avoid PostgreSQL's expensive Instrumentation) */
+	int64       tuples_returned;    /* Count of non-NULL tuples returned */
 } WrappedNode;
 
 static WrappedNode wrapped_nodes[MAX_WRAPPED_NODES];
@@ -809,12 +813,7 @@ pg10046_timeout_handler(void)
 	int len;
 	int64 now;
 	struct timespec ts;
-	Instrumentation *current_node = NULL;
-
-	/* Stats from current node */
-	double tuples = 0;
-	int64 blks_hit = 0;
-	int64 blks_read = 0;
+	PlanState *current_node = NULL;
 
 	if (!trace_state.sampling_active || trace_state.trace_fd <= 0)
 		return;
@@ -839,20 +838,14 @@ pg10046_timeout_handler(void)
 			current_node = trace_state.call_stack[depth - 1];
 	}
 
-	/* Read instrumentation stats - simple memory reads, safe */
-	if (current_node != NULL)
-	{
-		tuples = current_node->tuplecount;
-		blks_hit = current_node->bufusage.shared_blks_hit;
-		blks_read = current_node->bufusage.shared_blks_read;
-	}
-
 	trace_state.sample_count++;
 
-	/* Format and write with full stats - snprintf and write are signal-safe */
-	len = snprintf(buf, sizeof(buf), "SAMPLE,%ld,%p,0x%08X,%d,%.0f,%ld,%ld\n",
-				   now, (void *)current_node, wait_event, trace_state.sample_count,
-				   tuples, blks_hit, blks_read);
+	/* Format and write - snprintf and write are signal-safe.
+	 * Note: we no longer have tuple/buffer stats in signal context since
+	 * we disabled PostgreSQL's expensive instrumentation.
+	 */
+	len = snprintf(buf, sizeof(buf), "SAMPLE,%ld,%p,0x%08X,%d,0,0,0\n",
+				   now, (void *)current_node, wait_event, trace_state.sample_count);
 
 	if (len > 0 && len < (int)sizeof(buf))
 	{
@@ -884,13 +877,8 @@ process_pending_sample(void)
 {
 	int64 now;
 	uint32 wait_event;
-	Instrumentation *current_node;
+	PlanState *current_node = NULL;
 	const char *wait_class;
-
-	/* Node statistics for progress tracking */
-	double ntuples = 0;
-	int64 blks_read = 0;
-	int64 blks_hit = 0;
 
 	if (!sample_pending || !trace_state.sampling_active)
 		return;
@@ -901,17 +889,11 @@ process_pending_sample(void)
 	wait_event = get_current_wait_event();
 	wait_class = get_wait_event_class_name(wait_event);
 
-	/* Find currently running node by scanning plan tree */
-	current_node = NULL;
-	if (trace_state.current_planstate != NULL)
-		current_node = find_running_node(trace_state.current_planstate);
-
-	/* Extract node statistics if available */
-	if (current_node != NULL)
+	/* Get current node from call stack */
 	{
-		ntuples = current_node->ntuples;
-		blks_read = current_node->bufusage.shared_blks_read;
-		blks_hit = current_node->bufusage.shared_blks_hit;
+		int depth = trace_state.call_stack_depth;
+		if (depth > 0 && depth <= MAX_NODE_STACK_DEPTH)
+			current_node = trace_state.call_stack[depth - 1];
 	}
 
 	/* Only emit sample if we have a wait event or are in a node */
@@ -920,20 +902,15 @@ process_pending_sample(void)
 		trace_state.sample_count++;
 
 		/*
-		 * SAMPLE format with progress stats:
-		 * SAMPLE,timestamp,node_ptr,wait_event_info,wait_class,sample_num,ntuples,blks_read,blks_hit
-		 *
-		 * This gives visibility into progress during long-running operations
+		 * SAMPLE format (simplified - no per-tuple stats without instrumentation):
+		 * SAMPLE,timestamp,node_ptr,wait_event_info,wait_class,sample_num,0,0,0
 		 */
-		write_trace_nonblock("SAMPLE,%ld,%p,0x%08X,%s,%d,%.0f,%ld,%ld\n",
+		write_trace_nonblock("SAMPLE,%ld,%p,0x%08X,%s,%d,0,0,0\n",
 							 now,
 							 (void *)current_node,
 							 wait_event,
 							 wait_class,
-							 trace_state.sample_count,
-							 ntuples,
-							 blks_read,
-							 blks_hit);
+							 trace_state.sample_count);
 	}
 
 	/*
@@ -1006,12 +983,12 @@ cancel_sampling_timer(void)
  * This ensures the signal handler always sees consistent data.
  */
 static void
-push_call_stack(Instrumentation *instr)
+push_call_stack(PlanState *node)
 {
 	int depth = trace_state.call_stack_depth;
 	if (depth < MAX_NODE_STACK_DEPTH)
 	{
-		trace_state.call_stack[depth] = instr;
+		trace_state.call_stack[depth] = node;
 		/* Memory barrier to ensure array write is visible before depth update */
 		pg_memory_barrier();
 		trace_state.call_stack_depth = depth + 1;
@@ -1279,12 +1256,7 @@ pg10046_ExecProcNode(PlanState *node)
 {
 	TupleTableSlot *result;
 	WrappedNode *wn;
-	Instrumentation *instr = node->instrument;
-	const char *node_name = get_planstate_node_name(nodeTag(node));
-	char target_buf[NAMEDATALEN];
-	const char *target;
 	int64 now;
-	double current_tuples;
 
 	/* Find our wrapped node entry */
 	wn = find_wrapped_node(node);
@@ -1294,31 +1266,32 @@ pg10046_ExecProcNode(PlanState *node)
 		return NULL;
 	}
 
-	/* Track last call time for accurate NODE_END on early stop (LIMIT, etc.) */
-	now = get_trace_timestamp();
-	wn->last_call_time = now;
-
-	/* Get scan target (table/index name) for context */
-	target = get_scan_target(node, target_buf, sizeof(target_buf));
-
 	/*
 	 * NODE_START: Emit on first call to this node (lifecycle event)
+	 * Only compute expensive things (timestamp, node_name, target) on first call.
 	 */
 	if (!wn->started)
 	{
+		const char *node_name = get_planstate_node_name(nodeTag(node));
+		char target_buf[NAMEDATALEN];
+		const char *target = get_scan_target(node, target_buf, sizeof(target_buf));
+
+		now = get_trace_timestamp();
 		wn->started = true;
 		wn->start_time = now;
+		wn->last_call_time = now;
 		wn->last_progress_tuples = 0;
 
 		write_trace("NODE_START,%ld,%p,%s,%s\n",
-					now, (void *)instr, node_name, target);
+					now, (void *)node, node_name, target);
 	}
 
 	/*
-	 * PUSH onto call stack (on EVERY entry)
+	 * PUSH onto call stack (only if sampling is enabled)
 	 * This is the key to Alternative 3 - stack mirrors C call stack
 	 */
-	push_call_stack(instr);
+	if (pg10046_sample_interval_ms > 0)
+		push_call_stack(node);
 
 	/* Call original ExecProcNode */
 	result = wn->original_func(node);
@@ -1336,30 +1309,34 @@ pg10046_ExecProcNode(PlanState *node)
 	}
 
 	/*
-	 * POP from call stack (on EVERY exit)
+	 * POP from call stack (only if sampling is enabled)
 	 */
-	pop_call_stack();
+	if (pg10046_sample_interval_ms > 0)
+		pop_call_stack();
 
-	/* Get current tuple count */
-	current_tuples = instr ? instr->tuplecount : 0;
+	/*
+	 * Count tuples ourselves (avoids expensive PostgreSQL Instrumentation)
+	 */
+	if (!TupIsNull(result))
+		wn->tuples_returned++;
 
 	/*
 	 * PROGRESS: Emit every Y tuples (debug mode)
+	 * Uses our self-tracked tuple count.
 	 */
-	if (pg10046_progress_interval_tuples > 0 && instr && !TupIsNull(result))
+	if (pg10046_progress_interval_tuples > 0 && !TupIsNull(result))
 	{
-		double tuples_since_last = current_tuples - wn->last_progress_tuples;
+		int64 tuples_since_last = wn->tuples_returned - (int64)wn->last_progress_tuples;
 
 		if (tuples_since_last >= pg10046_progress_interval_tuples)
 		{
+			const char *node_name = get_planstate_node_name(nodeTag(node));
 			now = get_trace_timestamp();
-			write_trace("PROGRESS,%ld,%p,%s,%.0f,%ld,%ld\n",
-						now, (void *)instr, node_name,
-						current_tuples,
-						instr->bufusage.shared_blks_hit,
-						instr->bufusage.shared_blks_read);
+			write_trace("PROGRESS,%ld,%p,%s,%ld,0,0\n",
+						now, (void *)node, node_name,
+						wn->tuples_returned);
 
-			wn->last_progress_tuples = current_tuples;
+			wn->last_progress_tuples = (double)wn->tuples_returned;
 		}
 	}
 
@@ -1373,11 +1350,25 @@ pg10046_ExecProcNode(PlanState *node)
 	 */
 	if (TupIsNull(result) && !wn->finished)
 	{
+		const char *node_name = get_planstate_node_name(nodeTag(node));
+		char target_buf[NAMEDATALEN];
+		const char *target = get_scan_target(node, target_buf, sizeof(target_buf));
+		Instrumentation *instr = node->instrument;
 		int64 elapsed;
+		int64 blks_hit = 0;
+		int64 blks_read = 0;
 
 		wn->finished = true;
 		now = get_trace_timestamp();
+		wn->last_call_time = now;  /* Update for accurate timing */
 		elapsed = now - wn->start_time;
+
+		/* Get buffer stats from instrumentation if available (track_buffers=on) */
+		if (instr)
+		{
+			blks_hit = instr->bufusage.shared_blks_hit;
+			blks_read = instr->bufusage.shared_blks_read;
+		}
 
 		/*
 		 * First, cascade NODE_END to any unfinished children.
@@ -1385,22 +1376,14 @@ pg10046_ExecProcNode(PlanState *node)
 		 */
 		cascade_node_end_to_children(node, now);
 
-		/* Emit NODE_END for this node */
-		if (instr)
-		{
-			write_trace("NODE_END,%ld,%p,%s,tuples=%.0f,blks_hit=%ld,blks_read=%ld,time_us=%ld,%s\n",
-						now, (void *)instr, node_name,
-						current_tuples,
-						instr->bufusage.shared_blks_hit,
-						instr->bufusage.shared_blks_read,
-						elapsed,
-						target);
-		}
-		else
-		{
-			write_trace("NODE_END,%ld,%p,%s,tuples=0,blks_hit=0,blks_read=0,time_us=%ld,%s\n",
-						now, (void *)instr, node_name, elapsed, target);
-		}
+		/* Emit NODE_END with stats */
+		write_trace("NODE_END,%ld,%p,%s,tuples=%ld,blks_hit=%ld,blks_read=%ld,time_us=%ld,%s\n",
+					now, (void *)node, node_name,
+					wn->tuples_returned,
+					blks_hit,
+					blks_read,
+					elapsed,
+					target);
 	}
 
 	return result;
@@ -1433,6 +1416,7 @@ wrap_planstate_nodes(PlanState *planstate)
 		wrapped_nodes[num_wrapped_nodes].start_time = 0;
 		wrapped_nodes[num_wrapped_nodes].last_call_time = 0;
 		wrapped_nodes[num_wrapped_nodes].last_progress_tuples = 0;
+		wrapped_nodes[num_wrapped_nodes].tuples_returned = 0;
 
 		num_wrapped_nodes++;
 
@@ -1708,6 +1692,18 @@ _PG_init(void)
 							 "When enabled, extension automatically starts/stops eBPF "
 							 "IO tracing through the pg_10046d daemon.",
 							 &pg10046_ebpf_enabled,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_10046.track_buffers",
+							 "Track per-node buffer statistics (WARNING: ~500% overhead!)",
+							 "When enabled, tracks shared_blks_hit/read per node using "
+							 "PostgreSQL's native instrumentation. This is EXPENSIVE and "
+							 "adds approximately 500% overhead. Only enable when you need "
+							 "detailed per-node buffer attribution.",
+							 &pg10046_track_buffers,
 							 false,
 							 PGC_USERSET,
 							 0,
@@ -2752,7 +2748,7 @@ emit_plan_tree(Plan *plan, int parent_id, int depth, PlannedStmt *pstmt)
 
 /*
  * Recursively emit node mapping for the plan tree
- * Format: NODE_MAP,instr_ptr,parent_instr_ptr,node_type,depth,target
+ * Format: NODE_MAP,node_ptr,parent_node_ptr,node_type,depth,target
  */
 static void
 emit_node_mapping(PlanState *planstate, PlanState *parent, int depth)
@@ -2767,10 +2763,10 @@ emit_node_mapping(PlanState *planstate, PlanState *parent, int depth)
 	node_type = get_planstate_node_name(nodeTag(planstate));
 	target = get_scan_target(planstate, target_buf, sizeof(target_buf));
 
-	/* Emit NODE_MAP line with pointer addresses */
+	/* Emit NODE_MAP line with PlanState pointer addresses */
 	write_trace("NODE_MAP,%p,%p,%s,%d,%s\n",
-				(void *)planstate->instrument,
-				parent ? (void *)parent->instrument : NULL,
+				(void *)planstate,
+				(void *)parent,
 				node_type,
 				depth,
 				target);
@@ -2940,27 +2936,17 @@ emit_exec_stats(PlanState *planstate, int parent_id, int depth)
 	const char *node_type;
 	char target_buf[NAMEDATALEN];
 	const char *target;
-	Instrumentation *instr;
+	WrappedNode *wn;
 	int my_id;
 
-	/* Basic stats */
-	double rows = 0;
-	double nloops = 0;
-	double nfiltered = 0;
-
-	/* Timing */
+	/* Basic stats - from our self-tracked data */
+	int64 rows = 0;
 	double time_ms = 0;
-	double startup_ms = 0;
 
-	/* Buffer stats */
-	int64 blks_hit = 0;
-	int64 blks_read = 0;
-	int64 temp_read = 0;
-	int64 temp_written = 0;
-
-	/* WAL stats */
-	int64 wal_records = 0;
-	int64 wal_bytes = 0;
+	/* Buffer stats from instrumentation (only when track_buffers=on) */
+	int64 blks_hit = 0, blks_read = 0;
+	int64 local_blks_hit = 0, local_blks_read = 0;
+	int64 temp_blks_read = 0, temp_blks_written = 0;
 
 	if (planstate == NULL)
 		return;
@@ -2968,48 +2954,43 @@ emit_exec_stats(PlanState *planstate, int parent_id, int depth)
 	my_id = ++stat_node_id_counter;
 	node_type = get_planstate_node_name(nodeTag(planstate));
 	target = get_scan_target(planstate, target_buf, sizeof(target_buf));
-	instr = planstate->instrument;
 
-	if (instr)
+	/* Get stats from our wrapped node tracking */
+	wn = find_wrapped_node(planstate);
+	if (wn)
 	{
-		/* Finalize instrumentation */
-		InstrEndLoop(instr);
+		rows = wn->tuples_returned;
+		if (wn->start_time > 0 && wn->last_call_time > 0)
+			time_ms = (wn->last_call_time - wn->start_time) / 1000.0;
+	}
 
-		rows = instr->ntuples;
-		nloops = instr->nloops;
-		nfiltered = instr->nfiltered1 + instr->nfiltered2;
-
-		time_ms = instr->total * 1000.0;
-		startup_ms = instr->startup * 1000.0;
-
+	if (pg10046_track_buffers && planstate->instrument)
+	{
+		Instrumentation *instr = planstate->instrument;
 		blks_hit = instr->bufusage.shared_blks_hit;
 		blks_read = instr->bufusage.shared_blks_read;
-		temp_read = instr->bufusage.temp_blks_read;
-		temp_written = instr->bufusage.temp_blks_written;
-
-		wal_records = instr->walusage.wal_records;
-		wal_bytes = instr->walusage.wal_bytes;
+		local_blks_hit = instr->bufusage.local_blks_hit;
+		local_blks_read = instr->bufusage.local_blks_read;
+		temp_blks_read = instr->bufusage.temp_blks_read;
+		temp_blks_written = instr->bufusage.temp_blks_written;
 	}
 
 	/* Emit STAT line */
-	write_trace("STAT,%d,%d,%d,%s,%.0f,%.0f,%.0f,%.3f,%.3f,%ld,%ld,%ld,%ld,%ld,%ld,%s,%p\n",
+	write_trace("STAT,%d,%d,%d,%s,%ld,1,0,%.3f,0.000,%ld,%ld,%ld,%ld,%ld,%ld,%s,%p\n",
 				my_id,
 				parent_id,
 				depth,
 				node_type,
 				rows,
-				nloops,
-				nfiltered,
 				time_ms,
-				startup_ms,
 				blks_hit,
 				blks_read,
-				temp_read,
-				temp_written,
-				wal_records,
-				wal_bytes,
+				local_blks_hit,
+				local_blks_read,
+				temp_blks_read,
+				temp_blks_written,
 				target,
-				(void *)instr);  /* Include instr pointer for correlation */
+				(void *)planstate);
 
 	emit_node_specific_info(planstate, my_id);
 
@@ -3294,10 +3275,23 @@ pg10046_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	if (pg10046_enabled)
 	{
-		if (queryDesc->instrument_options == 0)
-			queryDesc->instrument_options = INSTRUMENT_ALL;
-		else
-			queryDesc->instrument_options |= INSTRUMENT_ALL;
+		/*
+		 * By default, DON'T enable PostgreSQL's native instrumentation - it's too
+		 * expensive. PostgreSQL's InstrStartNode/InstrStopNode add significant
+		 * overhead even without INSTRUMENT_TIMER.
+		 *
+		 * If pg_10046.track_buffers is enabled, we use INSTRUMENT_BUFFERS | INSTRUMENT_ROWS
+		 * to get per-node buffer stats. WARNING: This adds ~500% overhead!
+		 */
+		if (pg10046_track_buffers)
+		{
+			/* Enable expensive but detailed buffer tracking */
+			int needed_instruments = INSTRUMENT_BUFFERS | INSTRUMENT_ROWS;
+			if (queryDesc->instrument_options == 0)
+				queryDesc->instrument_options = needed_instruments;
+			else
+				queryDesc->instrument_options |= needed_instruments;
+		}
 
 		/* Reset wrapped nodes array for this query */
 		reset_wrapped_nodes();
