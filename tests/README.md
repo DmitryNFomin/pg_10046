@@ -1,6 +1,8 @@
 # pg_10046 Test Framework
 
-Comprehensive test suite for validating pg_10046 trace correctness.
+Comprehensive test suite for validating pg_10046 trace correctness and performance.
+
+**145 tests** covering trace correctness, node tracking, eBPF/IO/CPU events, and performance.
 
 ## Prerequisites
 
@@ -58,6 +60,22 @@ python3 run_tests.py -vv     # more verbose
 python3 run_tests.py simple       # test_simple_queries.py
 python3 run_tests.py node         # test_node_tracking.py
 python3 run_tests.py cross        # test_cross_backend.py
+python3 run_tests.py sampling     # test_sampling.py
+python3 run_tests.py ebpf         # test_ebpf_io.py (requires root)
+python3 run_tests.py bind         # test_bind_and_plan.py
+python3 run_tests.py perf         # test_performance.py
+```
+
+### Run eBPF Tests (Requires Root)
+
+eBPF tests require root privileges and the pg_10046 daemon running:
+
+```bash
+# Start the daemon first
+sudo python3 /usr/local/bin/pg_10046d.py &
+
+# Run eBPF tests as root
+sudo PGHOST=/var/run/postgresql PGUSER=postgres python3 run_tests.py ebpf
 ```
 
 ### Run Tests Matching Keyword
@@ -152,7 +170,7 @@ NODE_START/NODE_END pairing and complex plans:
 | `test_node_end_after_start` | Timing validation |
 | `test_child_within_parent` | Nested node timing |
 
-### test_cross_backend.py (18 tests)
+### test_cross_backend.py (19 tests)
 
 Cross-backend trace enable functionality:
 
@@ -174,6 +192,184 @@ Cross-backend trace enable functionality:
 | `test_disable_without_enable` | Disable without enable |
 | `test_negative_pid` | Negative PID handling |
 | `test_zero_pid` | Zero PID handling |
+
+### test_sampling.py (14 tests)
+
+SAMPLE events, wait events, and CPU tracking:
+
+| Test | Description |
+|------|-------------|
+| `test_long_query_generates_samples` | SAMPLE events for slow queries |
+| `test_sample_interval_header` | SAMPLE_INTERVAL_MS in header |
+| `test_sample_has_node_attribution` | Samples have node pointer |
+| `test_sample_count_in_sampling_end` | SAMPLING_END reports count |
+| `test_wait_event_format` | Wait event hex format |
+| `test_io_wait_captured` | IO waits during disk reads |
+| `test_samples_have_timestamps` | Valid timestamps |
+| `test_sample_timestamps_increase` | Monotonic timestamps |
+| `test_samples_within_execution` | Samples within EXEC_START/END |
+| `test_cpu_intensive_query_samples` | CPU samples without waits |
+| `test_sample_progress_stats` | Tuple/block counts in samples |
+| `test_fast_query_no_samples` | Fast queries may skip samples |
+| `test_multiple_queries_sampling` | Sampling across queries |
+| `test_cancelled_query_sampling` | Proper SAMPLING_START/END pairing |
+
+### test_ebpf_io.py (23 tests) - Requires Root
+
+eBPF daemon IO and CPU event capture:
+
+| Test | Description |
+|------|-------------|
+| `test_parse_io_read_event` | Parse IO_READ event line |
+| `test_parse_io_write_event` | Parse IO_WRITE event line |
+| `test_parse_multiple_events` | Parse mixed IO events |
+| `test_daemon_socket_exists` | Daemon socket at /var/run/pg_10046.sock |
+| `test_read_generates_io_events` | Table reads generate IO_READ |
+| `test_io_read_has_timing` | IO events have elapsed_us |
+| `test_write_generates_io_events` | INSERTs generate IO_WRITE |
+| `test_io_has_node_pointer` | IO events have node_ptr |
+| `test_io_relation_matches_query` | IO events reference correct table |
+| `test_trace_mentions_io_file` | Main trace references IO trace |
+| `test_io_trace_uuid_matches` | IO trace UUID matches main trace |
+| `test_io_event_fields_valid` | All IO fields are valid |
+| `test_io_timestamps_ordered` | IO timestamps are ordered |
+| `test_parse_cpu_off_event` | Parse CPU_OFF event |
+| `test_parse_cpu_on_event` | Parse CPU_ON event |
+| `test_parse_mixed_events` | Parse IO and CPU events |
+| `test_cpu_event_has_node_ptr` | CPU events have node pointer |
+| `test_cpu_intensive_generates_events` | CPU work generates events |
+| `test_cpu_events_have_timing` | CPU events have duration_us |
+| `test_cpu_off_on_pairing` | CPU_OFF/CPU_ON roughly paired |
+| `test_cpu_duration_reasonable` | CPU durations are reasonable |
+| `test_ebpf_trace_summary` | Summary properties work |
+
+### test_bind_and_plan.py (25 tests)
+
+Bind variables, plan tree output, and node-specific info:
+
+| Test | Description |
+|------|-------------|
+| `test_simple_parameterized_query` | BIND capture with $1 |
+| `test_multiple_bind_variables` | Multiple $1, $2, $3 binds |
+| `test_bind_variable_types` | Integer, text type capture |
+| `test_null_bind_variable` | NULL parameter capture |
+| `test_bind_count_in_binds_start` | BINDS_START parameter count |
+| `test_plan_start_end_markers` | PLAN_START/PLAN_END present |
+| `test_plan_contains_node_type` | Plan has node types (SeqScan) |
+| `test_plan_contains_index_scan` | IndexScan in plan |
+| `test_plan_contains_join` | Join nodes in plan |
+| `test_plan_has_cost_estimates` | Cost values in PLAN lines |
+| `test_plan_has_row_estimates` | Row estimates in PLAN lines |
+| `test_plan_time_captured` | PLAN_TIME captured |
+| `test_plan_tree_hierarchy` | Valid parent-child relationships |
+| `test_prepare_is_traced` | PREPARE/EXECUTE traced |
+| `test_execute_is_traced` | EXECUTE with bind values |
+| `test_multiple_executes` | Multiple EXECUTE calls |
+| `test_prepared_statement_replan` | Replan detection |
+| `test_sort_info_captured` | SORT method/space info |
+| `test_hash_info_captured` | HASH buckets/batches info |
+| `test_index_info_captured` | INDEX name capture |
+| `test_sort_method_types` | Different sort methods |
+| `test_stats_section_complete` | STATS_START/END complete |
+| `test_plan_matches_explain` | Plan matches EXPLAIN |
+| `test_root_node_has_no_parent` | Root has parent_id=0 |
+| `test_all_nodes_have_valid_ids` | All nodes have positive IDs |
+
+### test_performance.py (25 tests)
+
+Performance measurement and benchmarks:
+
+| Test | Description |
+|------|-------------|
+| `test_simple_select_overhead` | Simple SELECT overhead % |
+| `test_aggregation_overhead` | Aggregation query overhead |
+| `test_join_overhead` | JOIN query overhead |
+| `test_sort_overhead` | ORDER BY query overhead |
+| `test_rapid_queries_throughput` | QPS for rapid queries |
+| `test_mixed_query_throughput` | QPS for mixed queries |
+| `test_sustained_throughput` | Sustained QPS over 5 seconds |
+| `test_1k_rows_result` | Trace size for 1K rows |
+| `test_10k_rows_result` | Trace size for 10K rows |
+| `test_full_table_scan` | Trace for 100K row scan |
+| `test_large_sort` | Large sort operation |
+| `test_two_concurrent_sessions` | 2 concurrent traced sessions |
+| `test_five_concurrent_sessions` | 5 concurrent traced sessions |
+| `test_concurrent_with_untraced` | Impact on untraced sessions |
+| `test_simple_query_trace_size` | Simple query trace bytes |
+| `test_complex_query_trace_size` | Complex query trace bytes |
+| `test_many_queries_trace_size` | Linear scaling verification |
+| `test_trace_size_with_bind_variables` | Bind variable trace size |
+| `test_sleep_query` | pg_sleep tracing |
+| `test_cpu_intensive_query` | CPU-intensive query |
+| `test_io_intensive_query` | IO-intensive query |
+| `test_ebpf_high_io_rate` | eBPF with high IO (root) |
+| `test_ebpf_cpu_intensive` | eBPF CPU workload (root) |
+| `test_repeated_trace_sessions` | Memory stability |
+| `test_large_trace_cleanup` | Large trace handling |
+
+## Understanding Performance Test Results
+
+Performance tests print detailed metrics. Here's how to interpret them:
+
+### Overhead Metrics
+
+```
+Simple SELECT overhead (50 queries):
+  Baseline: 0.68ms/query (34ms total)
+  Traced:   3.00ms/query (150ms total)
+  Overhead: 341%
+```
+
+- **Baseline**: Average query time without tracing
+- **Traced**: Average query time with tracing enabled
+- **Overhead**: Percentage increase due to tracing
+
+**Expected values**: 100-500% overhead is normal due to trace file I/O and fsync.
+
+### Throughput Metrics
+
+```
+Sustained throughput (5s):
+  Queries: 1994
+  QPS: 398.6
+```
+
+- **QPS**: Queries per second achieved
+- **Expected**: 200-500 QPS for simple queries on typical hardware
+
+### Trace Size Metrics
+
+```
+Trace size scaling:
+  10 queries: 7,134 bytes (713 bytes/query)
+  50 queries: 34,094 bytes (682 bytes/query)
+  100 queries: 67,849 bytes (678 bytes/query)
+```
+
+- **Bytes/query**: Should remain roughly constant (linear scaling)
+- **Expected**: 500-1000 bytes per simple query
+
+### Concurrent Session Metrics
+
+```
+5 concurrent sessions:
+  Total queries: 150
+  Total time: 0.39s
+  QPS: 381.3
+```
+
+- Shows aggregate throughput with multiple traced sessions
+- QPS should not drop significantly with more sessions
+
+### Typical Results Summary
+
+| Metric | Expected Range | Notes |
+|--------|---------------|-------|
+| Simple query overhead | 100-500% | Higher on slow disk |
+| Throughput (QPS) | 200-500 | Depends on hardware |
+| Trace size per query | 500-1000 bytes | Linear scaling |
+| Concurrent session QPS | 300-400 | Slight decrease OK |
+| Trace for 10K rows | 5-10 KB | Not proportional to rows |
 
 ## Using the Test Library
 
@@ -385,14 +581,19 @@ The trace file may be empty or cleaned up. Run tests with `--skip-prereq` to ski
 ```
 tests/
 ├── run_tests.py              # Main entry point
+├── README.md                 # This file
 ├── lib/
 │   ├── __init__.py
 │   ├── trace_validator.py    # Trace parsing and validation
 │   ├── pg_harness.py         # PostgreSQL test harness
 │   └── assertions.py         # Reusable assertion functions
-├── test_simple_queries.py    # Basic query tests
-├── test_node_tracking.py     # Node pairing tests
-└── test_cross_backend.py     # Cross-backend tests
+├── test_simple_queries.py    # Basic query tests (16 tests)
+├── test_node_tracking.py     # Node pairing tests (24 tests)
+├── test_cross_backend.py     # Cross-backend tests (19 tests)
+├── test_sampling.py          # SAMPLE/wait events (14 tests)
+├── test_ebpf_io.py           # eBPF IO/CPU events (23 tests)
+├── test_bind_and_plan.py     # Bind vars, plan tree (25 tests)
+└── test_performance.py       # Performance benchmarks (25 tests)
 ```
 
 ### trace_validator.py
@@ -402,6 +603,10 @@ tests/
 - `TraceFile` - Container for parsed trace data
 - `TraceEvent` - Single trace event
 - `QueryExecution` - Query with plan and stats
+- `IOEvent` - IO_READ/IO_WRITE event from eBPF
+- `CPUEvent` - CPU_OFF/CPU_ON event from eBPF
+- `EBPFTraceFile` - Container for eBPF trace data
+- `IOTraceParser` - Parses eBPF IO/CPU trace files
 
 ### pg_harness.py
 
