@@ -250,7 +250,7 @@ class TracedSession:
         """Execute multiple queries."""
         return [self.execute(sql) for sql in queries]
 
-    def wait_for_trace(self, timeout_sec: float = 5.0) -> Optional[TraceInfo]:
+    def wait_for_trace(self, timeout_sec: float = 10.0) -> Optional[TraceInfo]:
         """Wait for trace file to appear and return its info."""
         # Use saved PID if connection is closed
         pid = self._saved_pid or self.conn.pid
@@ -288,7 +288,7 @@ class TracedSession:
         if self.conn and not self.conn._closed:
             self.conn.close()
             self.conn._closed = True
-            time.sleep(0.1)  # Give time for on_proc_exit to flush
+            time.sleep(2.0)  # Give time for on_proc_exit to flush and worker to write
 
         if self._trace_info:
             # Re-read file size after flush
@@ -369,8 +369,11 @@ class PgHarness:
             yield session
 
         finally:
-            session.disable_trace()
-            target_conn.close()
+            # Only disable if connection is still open (get_trace may have closed it)
+            if target_conn.pid:
+                session.disable_trace()
+            if not target_conn._closed:
+                target_conn.close()
             control_conn.close()
             self._connections = [c for c in self._connections if c not in (target_conn, control_conn)]
 

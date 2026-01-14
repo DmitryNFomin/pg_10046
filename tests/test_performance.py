@@ -515,7 +515,7 @@ class TestHighThroughput(unittest.TestCase):
 
             # Verify trace was captured
             trace_info = session.get_trace()
-            self.assertIsNotNone(trace_info)
+            self.assertIsNotNone(trace_info, "Trace file should exist")
 
         self.assertGreater(qps, MIN_QUERIES_PER_SECOND / 2,
                           f"QPS {qps:.1f} below minimum {MIN_QUERIES_PER_SECOND / 2}")
@@ -545,6 +545,9 @@ class TestHighThroughput(unittest.TestCase):
             print(f"    Time: {elapsed:.2f}s")
             print(f"    QPS: {qps:.1f}")
 
+        # Wait for async trace write to complete before next test
+        time.sleep(1.0)
+
         self.assertGreater(qps, MIN_QUERIES_PER_SECOND / 4)
 
     def test_sustained_throughput(self):
@@ -564,6 +567,9 @@ class TestHighThroughput(unittest.TestCase):
             print(f"\n  Sustained throughput ({duration_seconds}s):")
             print(f"    Queries: {query_count}")
             print(f"    QPS: {qps:.1f}")
+
+        # Wait for async trace write to complete before next test
+        time.sleep(1.0)
 
         self.assertGreater(qps, MIN_QUERIES_PER_SECOND)
 
