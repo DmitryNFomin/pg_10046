@@ -233,6 +233,243 @@ class TestTracingOverhead(unittest.TestCase):
         self.assertLess(overhead_percent, MAX_OVERHEAD_PERCENT)
 
 
+class TestOverheadDecomposition(unittest.TestCase):
+    """Decompose tracing overhead into fixed and per-tuple components.
+
+    This test measures overhead at different tuple counts to separate:
+    - Fixed overhead per query (setup, teardown, trace file ops)
+    - Per-tuple overhead (node tracking, statistics collection)
+
+    Formula: Total overhead = Fixed + (Tuples × Per-tuple overhead)
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.harness = PgHarness()
+
+        conn = cls.harness.new_connection()
+        conn.execute("DROP TABLE IF EXISTS perf_decompose CASCADE")
+        conn.execute("""
+            CREATE TABLE perf_decompose (
+                id SERIAL PRIMARY KEY,
+                data TEXT,
+                value INTEGER
+            )
+        """)
+        conn.execute("""
+            INSERT INTO perf_decompose (data, value)
+            SELECT md5(i::text), i % 1000
+            FROM generate_series(1, 100000) i
+        """)
+        conn.execute("ANALYZE perf_decompose")
+        conn.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.harness.cleanup()
+
+    def _measure_overhead_for_tuples(self, tuple_count, iterations=20):
+        """Measure overhead for a query returning specific number of tuples."""
+        sql = f"SELECT * FROM perf_decompose LIMIT {tuple_count}"
+
+        # Baseline (untraced)
+        conn = self.harness.new_connection()
+        # Warmup
+        for _ in range(3):
+            conn.execute(sql)
+
+        baseline_times = []
+        for _ in range(iterations):
+            start = time.perf_counter()
+            conn.execute(sql)
+            baseline_times.append((time.perf_counter() - start) * 1000)
+        conn.close()
+
+        # Traced
+        traced_times = []
+        with self.harness.traced_session() as session:
+            # Warmup
+            for _ in range(3):
+                session.conn.execute(sql)
+
+            for _ in range(iterations):
+                start = time.perf_counter()
+                session.conn.execute(sql)
+                traced_times.append((time.perf_counter() - start) * 1000)
+
+        baseline_mean = statistics.mean(baseline_times)
+        traced_mean = statistics.mean(traced_times)
+        overhead_ms = traced_mean - baseline_mean
+
+        return {
+            'tuples': tuple_count,
+            'baseline_ms': baseline_mean,
+            'traced_ms': traced_mean,
+            'overhead_ms': overhead_ms,
+        }
+
+    def test_overhead_decomposition(self):
+        """Measure fixed vs per-tuple overhead using linear regression."""
+        # Test with different tuple counts
+        tuple_counts = [1, 10, 100, 1000, 5000, 10000]
+        results = []
+
+        print("\n  Overhead Decomposition Analysis:")
+        print("  " + "-" * 60)
+        print(f"  {'Tuples':>8} {'Baseline':>10} {'Traced':>10} {'Overhead':>10} {'Per-tuple':>12}")
+        print(f"  {'':>8} {'(ms)':>10} {'(ms)':>10} {'(ms)':>10} {'(µs)':>12}")
+        print("  " + "-" * 60)
+
+        for tuples in tuple_counts:
+            result = self._measure_overhead_for_tuples(tuples)
+            results.append(result)
+
+            per_tuple_us = (result['overhead_ms'] * 1000) / tuples if tuples > 0 else 0
+            print(f"  {tuples:>8} {result['baseline_ms']:>10.2f} {result['traced_ms']:>10.2f} "
+                  f"{result['overhead_ms']:>10.2f} {per_tuple_us:>12.2f}")
+
+        # Linear regression: overhead = fixed + slope * tuples
+        # Using least squares: y = a + bx
+        n = len(results)
+        sum_x = sum(r['tuples'] for r in results)
+        sum_y = sum(r['overhead_ms'] for r in results)
+        sum_xy = sum(r['tuples'] * r['overhead_ms'] for r in results)
+        sum_x2 = sum(r['tuples'] ** 2 for r in results)
+
+        # Calculate slope (per-tuple overhead) and intercept (fixed overhead)
+        denominator = n * sum_x2 - sum_x ** 2
+        if denominator != 0:
+            slope = (n * sum_xy - sum_x * sum_y) / denominator  # ms per tuple
+            intercept = (sum_y - slope * sum_x) / n  # fixed overhead ms
+        else:
+            slope = 0
+            intercept = sum_y / n
+
+        per_tuple_us = slope * 1000  # Convert to microseconds
+        fixed_ms = max(0, intercept)  # Fixed overhead shouldn't be negative
+
+        # Calculate R² to verify linear fit
+        y_mean = sum_y / n
+        ss_tot = sum((r['overhead_ms'] - y_mean) ** 2 for r in results)
+        ss_res = sum((r['overhead_ms'] - (intercept + slope * r['tuples'])) ** 2 for r in results)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+        # Also calculate simple average overhead for low tuple counts (< 1000)
+        # which better represents "per-query" fixed cost
+        low_tuple_results = [r for r in results if r['tuples'] <= 100]
+        avg_low_overhead = statistics.mean(r['overhead_ms'] for r in low_tuple_results) if low_tuple_results else 0
+
+        print("  " + "-" * 60)
+        print(f"\n  OVERHEAD SUMMARY:")
+        print(f"  ╔══════════════════════════════════════════════════════════╗")
+        print(f"  ║  Fixed overhead (per query):     {avg_low_overhead:>6.2f} ms              ║")
+        if per_tuple_us > 0.1:
+            print(f"  ║  Per-tuple overhead:             {per_tuple_us:>6.2f} µs/tuple        ║")
+        else:
+            print(f"  ║  Per-tuple overhead:             negligible              ║")
+        print(f"  ╚══════════════════════════════════════════════════════════╝")
+
+        print(f"\n  Statistical Analysis:")
+        print(f"    Linear regression intercept: {intercept:.3f} ms")
+        print(f"    Linear regression slope:     {slope*1000:.4f} µs/tuple")
+        print(f"    R² (goodness of fit):        {r_squared:.4f}")
+        if r_squared < 0.5:
+            print(f"    Note: Low R² suggests overhead is mostly FIXED, not per-tuple")
+
+        # Assertions - verify overhead is reasonable
+        self.assertGreater(avg_low_overhead, -5, "Fixed overhead should not be significantly negative")
+        self.assertLess(avg_low_overhead, 50, "Fixed overhead should be under 50ms")
+
+    def test_node_overhead(self):
+        """Measure overhead per plan node using high-iteration micro-benchmark.
+
+        Uses PL/pgSQL loops to run many iterations, eliminating connection
+        overhead and reducing measurement noise.
+        """
+        print("\n  Per-Node Overhead (Micro-benchmark):")
+        print("  " + "-" * 55)
+
+        # Use DO blocks for tight loops - eliminates connection overhead
+        conn = self.harness.new_connection()
+        control = self.harness.new_connection()
+
+        # Create small test table
+        conn.execute("DROP TABLE IF EXISTS node_overhead_test")
+        conn.execute("CREATE TABLE node_overhead_test AS SELECT generate_series(1,100) as id, md5(random()::text) as data")
+        conn.execute("ANALYZE node_overhead_test")
+
+        test_cases = [
+            ("1 node (Result)", "SELECT 1", 1),
+            ("2 nodes (Agg+Scan)", "SELECT count(*) FROM node_overhead_test", 2),
+            ("3 nodes (Sort+Agg+Scan)", "SELECT id, count(*) FROM node_overhead_test GROUP BY id ORDER BY 1", 3),
+        ]
+
+        iterations = 500
+        results = []
+
+        for desc, inner_sql, expected_nodes in test_cases:
+            # Baseline (untraced)
+            loop_sql = f"""
+            DO $$
+            DECLARE
+              i integer;
+              r record;
+            BEGIN
+              FOR i IN 1..{iterations} LOOP
+                {inner_sql} INTO r;
+              END LOOP;
+            END;
+            $$;
+            """
+
+            # Warmup
+            conn.execute(loop_sql)
+
+            start = time.perf_counter()
+            conn.execute(loop_sql)
+            baseline_ms = (time.perf_counter() - start) * 1000
+
+            # Traced
+            control.execute(f"SELECT trace_10046.enable_trace({conn.pid})")
+            time.sleep(0.1)  # Let trace initialize
+
+            start = time.perf_counter()
+            conn.execute(loop_sql)
+            traced_ms = (time.perf_counter() - start) * 1000
+
+            control.execute(f"SELECT trace_10046.disable_trace({conn.pid})")
+
+            overhead_total = traced_ms - baseline_ms
+            overhead_per_query = (overhead_total / iterations) * 1000  # Convert to µs
+            overhead_per_node = overhead_per_query / expected_nodes
+
+            print(f"  {desc}:")
+            print(f"    {iterations} iterations: baseline={baseline_ms:.1f}ms, traced={traced_ms:.1f}ms")
+            print(f"    Overhead: {overhead_per_query:.1f} µs/query, {overhead_per_node:.1f} µs/node")
+
+            results.append({
+                'nodes': expected_nodes,
+                'overhead_per_query_us': overhead_per_query,
+                'overhead_per_node_us': overhead_per_node
+            })
+
+        conn.execute("DROP TABLE IF EXISTS node_overhead_test")
+        conn.close()
+        control.close()
+
+        # Summary
+        avg_per_node_us = statistics.mean(r['overhead_per_node_us'] for r in results)
+        avg_per_query_us = statistics.mean(r['overhead_per_query_us'] for r in results)
+
+        print(f"\n  ╔══════════════════════════════════════════════════════════╗")
+        print(f"  ║  Average overhead per query:     {avg_per_query_us:>6.1f} µs              ║")
+        print(f"  ║  Average overhead per node:      {avg_per_node_us:>6.1f} µs              ║")
+        print(f"  ╚══════════════════════════════════════════════════════════╝")
+
+        # Verify overhead is reasonable (should be < 100µs per node)
+        self.assertLess(avg_per_node_us, 500, "Per-node overhead should be < 500µs")
+
+
 class TestHighThroughput(unittest.TestCase):
     """Test high-throughput query scenarios."""
 

@@ -57,6 +57,7 @@
 #include "catalog/pg_am.h"
 #include "utils/portal.h"  /* For Portal structure - late-attach support */
 #include "tcop/pquery.h"   /* For ActivePortal global variable */
+#include "access/parallel.h"  /* For IsParallelWorker(), ParallelLeaderPid */
 
 PG_MODULE_MAGIC;
 
@@ -91,7 +92,7 @@ static int pg10046_ring_buffer_mb = 32;       /* Ring buffer size in MB (default
 static int pg10046_flush_interval_ms = 1000;  /* Flush interval in ms (default 1 second) */
 
 #define DEFAULT_DAEMON_SOCKET "/var/run/pg_10046.sock"
-#define TRACE_SLOT_SIZE 512                   /* Size of each trace slot in bytes */
+#define TRACE_SLOT_SIZE 4096                  /* Size of each trace slot in bytes (4KB) */
 #define TRACE_SLOT_DATA_SIZE (TRACE_SLOT_SIZE - 16)  /* Data area per slot */
 #define MAX_TRACED_BACKENDS 128               /* Max concurrent traced backends */
 
@@ -103,8 +104,8 @@ typedef struct TraceSlot
 {
 	pg_atomic_uint32 state;      /* 0=free, 1=writing, 2=ready */
 	uint32      pid;             /* Backend PID */
+	int16       backend_slot;    /* Backend slot in backends[] array (-1 if unknown) */
 	uint16      len;             /* Data length */
-	uint16      flags;           /* Reserved for future use */
 	char        data[TRACE_SLOT_DATA_SIZE];  /* Trace event data */
 } TraceSlot;
 
@@ -120,6 +121,7 @@ typedef struct TraceSlot
 typedef struct TracedBackend
 {
 	pg_atomic_uint32 active;     /* 0=inactive, 1=active */
+	pg_atomic_uint32 header_written;  /* 0=pending, 1=header written by worker */
 	uint32      pid;             /* Backend PID */
 	char        trace_path[MAXPGPATH];  /* Output file path */
 	char        trace_id[64];    /* Trace ID for correlation */
@@ -127,6 +129,16 @@ typedef struct TracedBackend
 	uint64      start_time_ns;   /* Trace start time */
 	pg_atomic_uint64 events_written;   /* Events written to file */
 	pg_atomic_uint64 events_dropped;   /* Events dropped (buffer full) */
+
+	/* GUC values at trace start (for header generation by worker) */
+	int         sample_interval_ms;
+	bool        ebpf_enabled;
+	int         ring_buffer_mb;
+
+	/* Parallel worker support */
+	uint32      leader_pid;      /* If parallel worker, leader's PID (0 if leader) */
+	int         worker_id;       /* Worker ID (-1 if leader, 0+ for workers) */
+	char        leader_trace_uuid[40];  /* Leader's trace UUID for correlation */
 } TracedBackend;
 
 /*
@@ -241,9 +253,19 @@ typedef struct TraceState
 	bool		ebpf_active;
 	char		ebpf_trace_path[MAXPGPATH];
 
+	/* Parallel worker support */
+	bool		is_parallel_worker;  /* True if this is a parallel worker */
+	uint32		leader_pid;          /* Leader's PID (if parallel worker) */
+	int			worker_id;           /* Worker ID (0+ for workers, -1 for leader) */
+	char		leader_trace_uuid[40]; /* Leader's trace UUID for correlation */
+
 } TraceState;
 
-static TraceState trace_state = {0};
+static TraceState trace_state = {
+	.active = false,
+	.trace_fd = -1,  /* -1 = no trace file open */
+	.worker_id = -1, /* -1 = not a parallel worker */
+};
 
 /*
  * Calculate shared memory size for ring buffer.
@@ -309,11 +331,18 @@ pg10046_shmem_startup(void)
 		for (i = 0; i < MAX_TRACED_BACKENDS; i++)
 		{
 			pg_atomic_init_u32(&ring_buffer_ctl->backends[i].active, 0);
+			pg_atomic_init_u32(&ring_buffer_ctl->backends[i].header_written, 0);
 			ring_buffer_ctl->backends[i].pid = 0;
 			ring_buffer_ctl->backends[i].trace_path[0] = '\0';
 			ring_buffer_ctl->backends[i].trace_id[0] = '\0';
 			ring_buffer_ctl->backends[i].trace_uuid[0] = '\0';
 			ring_buffer_ctl->backends[i].start_time_ns = 0;
+			ring_buffer_ctl->backends[i].sample_interval_ms = 0;
+			ring_buffer_ctl->backends[i].ebpf_enabled = false;
+			ring_buffer_ctl->backends[i].ring_buffer_mb = 0;
+			ring_buffer_ctl->backends[i].leader_pid = 0;
+			ring_buffer_ctl->backends[i].worker_id = -1;
+			ring_buffer_ctl->backends[i].leader_trace_uuid[0] = '\0';
 			pg_atomic_init_u64(&ring_buffer_ctl->backends[i].events_written, 0);
 			pg_atomic_init_u64(&ring_buffer_ctl->backends[i].events_dropped, 0);
 
@@ -332,8 +361,8 @@ pg10046_shmem_startup(void)
 		{
 			pg_atomic_init_u32(&ring_buffer_slots[i].state, SLOT_FREE);
 			ring_buffer_slots[i].pid = 0;
+			ring_buffer_slots[i].backend_slot = -1;
 			ring_buffer_slots[i].len = 0;
-			ring_buffer_slots[i].flags = 0;
 		}
 
 		elog(LOG, "pg_10046: initialized ring buffer with %lu slots (%d MB)",
@@ -370,6 +399,7 @@ register_traced_backend(void)
 										   &expected, 1))
 		{
 			/* Got the slot - fill in details */
+			pg_atomic_write_u32(&ring_buffer_ctl->backends[i].header_written, 0);
 			ring_buffer_ctl->backends[i].pid = MyProcPid;
 			strlcpy(ring_buffer_ctl->backends[i].trace_path,
 					trace_state.trace_path, MAXPGPATH);
@@ -378,8 +408,21 @@ register_traced_backend(void)
 			strlcpy(ring_buffer_ctl->backends[i].trace_uuid,
 					trace_state.trace_uuid, sizeof(ring_buffer_ctl->backends[i].trace_uuid));
 			ring_buffer_ctl->backends[i].start_time_ns = trace_state.start_time_ns;
+
+			/* GUC values for header generation by worker */
+			ring_buffer_ctl->backends[i].sample_interval_ms = pg10046_sample_interval_ms;
+			ring_buffer_ctl->backends[i].ebpf_enabled = pg10046_ebpf_enabled;
+			ring_buffer_ctl->backends[i].ring_buffer_mb = pg10046_ring_buffer_mb;
+
 			pg_atomic_write_u64(&ring_buffer_ctl->backends[i].events_written, 0);
 			pg_atomic_write_u64(&ring_buffer_ctl->backends[i].events_dropped, 0);
+
+			/* Parallel worker info */
+			ring_buffer_ctl->backends[i].leader_pid = trace_state.leader_pid;
+			ring_buffer_ctl->backends[i].worker_id = trace_state.worker_id;
+			strlcpy(ring_buffer_ctl->backends[i].leader_trace_uuid,
+					trace_state.leader_trace_uuid,
+					sizeof(ring_buffer_ctl->backends[i].leader_trace_uuid));
 
 			/* Memory barrier to ensure all writes are visible */
 			pg_memory_barrier();
@@ -402,9 +445,11 @@ unregister_traced_backend(int slot)
 	if (ring_buffer_ctl == NULL || slot < 0 || slot >= MAX_TRACED_BACKENDS)
 		return;
 
-	/* Clear the slot */
-	ring_buffer_ctl->backends[slot].pid = 0;
-	ring_buffer_ctl->backends[slot].trace_path[0] = '\0';
+	/*
+	 * Don't clear pid or trace_path - the background worker may still
+	 * need them to process pending ring buffer entries for this backend.
+	 * Just mark as inactive so a new backend can eventually reuse the slot.
+	 */
 
 	/* Memory barrier before marking inactive */
 	pg_memory_barrier();
@@ -486,8 +531,8 @@ ring_buffer_write(const char *data, int len)
 
 	/* Write data */
 	slot->pid = MyProcPid;
+	slot->backend_slot = my_backend_slot;  /* Cache backend slot for worker */
 	slot->len = len;
-	slot->flags = 0;
 	memcpy(slot->data, data, len);
 	slot->data[len] = '\0';
 
@@ -596,28 +641,25 @@ pg10046_worker_main(Datum main_arg)
 
 				/* Find the trace file for this backend */
 				{
-					int		backend_slot = -1;
+					int		backend_slot = slot->backend_slot;  /* Use cached slot */
 					uint32	pid = slot->pid;
 
-					/* Look up backend by PID */
-					for (i = 0; i < MAX_TRACED_BACKENDS; i++)
+					/*
+					 * Use cached backend_slot if valid AND either:
+					 * - fd_cache is already open (don't care about current slot owner)
+					 * - OR the slot still belongs to same PID (not reused yet)
+					 */
+					if (backend_slot >= 0 &&
+						(fd_cache[backend_slot] >= 0 ||
+						 ring_buffer_ctl->backends[backend_slot].pid == pid))
 					{
-						if (pg_atomic_read_u32(&ring_buffer_ctl->backends[i].active) &&
-							ring_buffer_ctl->backends[i].pid == pid)
-						{
-							backend_slot = i;
-							break;
-						}
-					}
 
-					if (backend_slot >= 0)
-					{
 						/* Open file if not cached */
 						if (fd_cache[backend_slot] < 0)
 						{
 							fd_cache[backend_slot] = open(
 								ring_buffer_ctl->backends[backend_slot].trace_path,
-								O_WRONLY | O_CREAT | O_APPEND,
+								O_WRONLY | O_CREAT | O_TRUNC,  /* TRUNC for new file */
 								S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
 							if (fd_cache[backend_slot] < 0)
@@ -625,6 +667,75 @@ pg10046_worker_main(Datum main_arg)
 								elog(WARNING, "pg_10046: could not open trace file %s: %m",
 									 ring_buffer_ctl->backends[backend_slot].trace_path);
 							}
+							else
+							{
+								/* Ensure correct permissions regardless of umask */
+								fchmod(fd_cache[backend_slot], S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+							}
+						}
+
+						/* Write header if not yet written */
+						if (fd_cache[backend_slot] >= 0 &&
+							!pg_atomic_read_u32(&ring_buffer_ctl->backends[backend_slot].header_written))
+						{
+							TracedBackend *be = &ring_buffer_ctl->backends[backend_slot];
+							char header_buf[2048];
+							int len;
+							ssize_t ret pg_attribute_unused();
+
+							/* Generate header from shared memory info */
+							if (be->worker_id >= 0)
+							{
+								/* Parallel worker header */
+								len = snprintf(header_buf, sizeof(header_buf),
+									"# PG_10046 TRACE (PARALLEL WORKER)\n"
+									"# TRACE_ID: %s\n"
+									"# TRACE_UUID: %s\n"
+									"# PID: %u\n"
+									"# LEADER_PID: %u\n"
+									"# LEADER_TRACE_UUID: %s\n"
+									"# WORKER_ID: %d\n"
+									"# START_TIME: %lu\n"
+									"# SAMPLE_INTERVAL_MS: %d\n"
+									"# RING_BUFFER_MB: %d\n"
+									"#\n",
+									be->trace_id,
+									be->trace_uuid,
+									be->pid,
+									be->leader_pid,
+									be->leader_trace_uuid,
+									be->worker_id,
+									(unsigned long) be->start_time_ns,
+									be->sample_interval_ms,
+									be->ring_buffer_mb);
+							}
+							else
+							{
+								/* Leader/normal backend header */
+								len = snprintf(header_buf, sizeof(header_buf),
+									"# PG_10046 TRACE\n"
+									"# TRACE_ID: %s\n"
+									"# TRACE_UUID: %s\n"
+									"# PID: %u\n"
+									"# START_TIME: %lu\n"
+									"# SAMPLE_INTERVAL_MS: %d\n"
+									"# EBPF_ENABLED: %s\n"
+									"# RING_BUFFER_MB: %d\n"
+									"# RING_BUFFER_ACTIVE: true\n"
+									"#\n",
+									be->trace_id,
+									be->trace_uuid,
+									be->pid,
+									(unsigned long) be->start_time_ns,
+									be->sample_interval_ms,
+									be->ebpf_enabled ? "true" : "false",
+									be->ring_buffer_mb);
+							}
+
+							if (len > 0 && len < (int)sizeof(header_buf))
+								ret = write(fd_cache[backend_slot], header_buf, len);
+
+							pg_atomic_write_u32(&be->header_written, 1);
 						}
 
 						/* Write to file */
@@ -744,8 +855,8 @@ static void pg10046_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 static void pg10046_ExecutorEnd(QueryDesc *queryDesc);
 static void pg10046_on_proc_exit(int code, Datum arg);
 static void open_trace_file(void);
+static void open_worker_trace_file(int leader_pid, const char *leader_uuid, int worker_id);
 static void write_trace(const char *fmt, ...) pg_attribute_printf(1, 2);
-static void write_trace_direct(const char *fmt, ...) pg_attribute_printf(1, 2);
 static void write_trace_nonblock(const char *fmt, ...) pg_attribute_printf(1, 2);
 static void emit_bind_variables(ParamListInfo params);
 static void emit_plan_tree(Plan *plan, int parent_id, int depth, PlannedStmt *pstmt);
@@ -1124,16 +1235,33 @@ start_trace_buffering(void)
 static void
 flush_trace_buffer(void)
 {
-	ssize_t ret pg_attribute_unused();
-
 	if (!local_trace_buf_active || local_trace_buf == NULL || local_trace_buf_pos == 0)
 		return;
 
 	local_trace_buf_active = false;  /* Prevent recursion */
 
-	/* Single direct write - bypasses expensive ring buffer operations */
-	if (trace_state.trace_fd > 0)
-		ret = write(trace_state.trace_fd, local_trace_buf, local_trace_buf_pos);
+	/*
+	 * Write through ring buffer (lazy file creation).
+	 * The background worker will create the file and write the data.
+	 *
+	 * Split into chunks if buffer is larger than ring slot size.
+	 */
+	if (ring_buffer_ctl != NULL &&
+		pg_atomic_read_u32(&ring_buffer_ctl->worker_running) &&
+		my_backend_slot >= 0)
+	{
+		int offset = 0;
+		int remaining = local_trace_buf_pos;
+		int chunk_size = TRACE_SLOT_DATA_SIZE - 1;  /* Max data per slot */
+
+		while (remaining > 0)
+		{
+			int write_len = (remaining > chunk_size) ? chunk_size : remaining;
+			ring_buffer_write(local_trace_buf + offset, write_len);
+			offset += write_len;
+			remaining -= write_len;
+		}
+	}
 
 	local_trace_buf_pos = 0;
 }
@@ -1606,6 +1734,60 @@ find_backend_slot_by_pid(int target_pid)
 }
 
 /*
+ * Check if a backend (by PID) has active tracing enabled.
+ * If found, copies the trace UUID to leader_uuid (if not NULL).
+ * Returns true if the backend has active tracing.
+ */
+static bool
+is_backend_traced(int target_pid, char *leader_uuid, size_t uuid_len)
+{
+	int i;
+
+	if (ring_buffer_ctl == NULL)
+		return false;
+
+	for (i = 0; i < MAX_TRACED_BACKENDS; i++)
+	{
+		if (pg_atomic_read_u32(&ring_buffer_ctl->backends[i].active) &&
+			ring_buffer_ctl->backends[i].pid == (uint32) target_pid)
+		{
+			if (leader_uuid != NULL && uuid_len > 0)
+			{
+				strlcpy(leader_uuid, ring_buffer_ctl->backends[i].trace_uuid, uuid_len);
+			}
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Count active parallel workers for a leader PID.
+ * Used to assign worker IDs.
+ */
+static int
+count_parallel_workers_for_leader(int leader_pid)
+{
+	int i;
+	int count = 0;
+
+	if (ring_buffer_ctl == NULL)
+		return 0;
+
+	for (i = 0; i < MAX_TRACED_BACKENDS; i++)
+	{
+		if (pg_atomic_read_u32(&ring_buffer_ctl->backends[i].active) &&
+			ring_buffer_ctl->backends[i].leader_pid == (uint32) leader_pid)
+		{
+			count++;
+		}
+	}
+
+	return count;
+}
+
+/*
  * pg_10046_enable_trace(target_pid int) - Enable tracing on another backend.
  *
  * Sets a flag in shared memory that the target backend will check at the
@@ -1916,10 +2098,10 @@ pg10046_on_proc_exit(int code, Datum arg)
 	flush_trace_buffer();
 
 	/* Close trace file */
-	if (trace_state.trace_fd > 0)
+	if (trace_state.trace_fd >= 0)
 	{
 		close(trace_state.trace_fd);
-		trace_state.trace_fd = 0;
+		trace_state.trace_fd = -1;
 	}
 
 	/* Unregister from ring buffer */
@@ -2137,8 +2319,8 @@ open_trace_file(void)
 	struct tm *tm_info;
 	char timestamp[20];
 
-	if (trace_state.trace_fd > 0)
-		return;
+	if (trace_state.active)
+		return;  /* Already initialized */
 
 	clock_gettime(CLOCK_REALTIME, &ts);
 	now = time(NULL);
@@ -2163,19 +2345,12 @@ open_trace_file(void)
 			 pg10046_trace_dir ? pg10046_trace_dir : "/tmp",
 			 trace_state.trace_id);
 
-	trace_state.trace_fd = open(trace_state.trace_path,
-								O_WRONLY | O_CREAT | O_TRUNC,
-								S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-
-	if (trace_state.trace_fd < 0)
-	{
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("pg_10046: could not open trace file \"%s\": %m",
-						trace_state.trace_path)));
-		return;
-	}
-
+	/*
+	 * LAZY FILE CREATION: Don't open file here.
+	 * Background worker will create file on first write.
+	 * This removes ~1ms of synchronous I/O overhead from first query.
+	 */
+	trace_state.trace_fd = -1;  /* No file yet - worker creates it */
 	trace_state.active = true;
 	trace_state.query_id = 0;
 	trace_state.call_stack_depth = 0;
@@ -2191,30 +2366,14 @@ open_trace_file(void)
 		exit_callback_registered = true;
 	}
 
-	/*
-	 * Write trace header DIRECTLY (not through ring buffer).
-	 * This prevents race conditions where SAMPLE events from the timeout
-	 * handler (which also writes directly) could appear before the header.
-	 */
-	write_trace_direct("# PG_10046 TRACE\n");
-	write_trace_direct("# TRACE_ID: %s\n", trace_state.trace_id);
-	write_trace_direct("# TRACE_UUID: %s\n", trace_state.trace_uuid);
-	write_trace_direct("# PID: %d\n", MyProcPid);
-	write_trace_direct("# START_TIME: %lu\n", (unsigned long) trace_state.start_time_ns);
-	write_trace_direct("# SAMPLE_INTERVAL_MS: %d\n", pg10046_sample_interval_ms);
-	write_trace_direct("# EBPF_ENABLED: %s\n", pg10046_ebpf_enabled ? "true" : "false");
-	write_trace_direct("# RING_BUFFER_MB: %d\n", pg10046_ring_buffer_mb);
-	write_trace_direct("# RING_BUFFER_ACTIVE: %s\n",
-				(ring_buffer_ctl && pg_atomic_read_u32(&ring_buffer_ctl->worker_running)) ?
-				"true" : "false");
-	write_trace_direct("#\n");
+	/* Register with ring buffer - worker will use this info for header */
+	my_backend_slot = register_traced_backend();
 
-	/* Start eBPF tracing if enabled (and not already started externally) */
+	/* Start eBPF tracing if enabled (writes go through ring buffer) */
 	if (trace_state.ebpf_active)
 	{
 		/* eBPF was already started externally (e.g., by pg_10046_attach CLI) */
-		write_trace_direct("# eBPF tracing: EXTERNAL (started by CLI tool)\n");
-		write_trace_direct("#\n");
+		write_trace("# eBPF tracing: EXTERNAL (started by CLI tool)\n#\n");
 	}
 	else if (pg10046_ebpf_enabled)
 	{
@@ -2222,14 +2381,10 @@ open_trace_file(void)
 	}
 	else
 	{
-		write_trace_direct("# To collect IO events manually, start eBPF tracer:\n");
-		write_trace_direct("#   pg_10046_ebpf.sh start %d %s\n", MyProcPid, trace_state.trace_uuid);
-		write_trace_direct("# eBPF trace file: pg_10046_io_%s.trc\n", trace_state.trace_id);
-		write_trace_direct("#\n");
+		write_trace("# To collect IO events manually, start eBPF tracer:\n");
+		write_trace("#   pg_10046_ebpf.sh start %d %s\n", MyProcPid, trace_state.trace_uuid);
+		write_trace("# eBPF trace file: pg_10046_io_%s.trc\n#\n", trace_state.trace_id);
 	}
-
-	/* Now register this backend for ring buffer writes */
-	my_backend_slot = register_traced_backend();
 
 	/*
 	 * LATE-ATTACH: Check if there's an already-running query.
@@ -2241,29 +2396,77 @@ open_trace_file(void)
 }
 
 /*
- * Write formatted line to trace file - DIRECT write (bypasses ring buffer).
- * Used for header writes that must appear before any ring buffer events.
+ * Open trace file for a parallel worker.
+ * Similar to open_trace_file but includes worker-specific info and
+ * links to the leader's trace via leader_uuid.
+ *
+ * Parameters:
+ *   leader_pid - PID of the parallel leader
+ *   leader_uuid - UUID of the leader's trace (for correlation)
+ *   worker_id - This worker's ID (0, 1, 2, ...)
  */
 static void
-write_trace_direct(const char *fmt, ...)
+open_worker_trace_file(int leader_pid, const char *leader_uuid, int worker_id)
 {
-	va_list		args;
-	char		buf[8192];
-	int			len;
+	struct timespec ts;
+	time_t now;
+	struct tm *tm_info;
+	char timestamp[20];
 
-	if (trace_state.trace_fd <= 0)
-		return;
+	if (trace_state.active)
+		return;  /* Already initialized */
 
-	va_start(args, fmt);
-	len = vsnprintf(buf, sizeof(buf), fmt, args);
-	va_end(args);
+	clock_gettime(CLOCK_REALTIME, &ts);
+	now = time(NULL);
+	tm_info = localtime(&now);
 
-	if (len > 0)
+	/* Generate timestamp as YYYYMMDDHHMMSS */
+	strftime(timestamp, sizeof(timestamp), "%Y%m%d%H%M%S", tm_info);
+
+	/* Generate TRACE_ID: <pid>_<timestamp> */
+	snprintf(trace_state.trace_id, sizeof(trace_state.trace_id),
+			 "%d_%s", MyProcPid, timestamp);
+
+	/* Use our own UUID but also store leader's for correlation */
+	generate_uuid(trace_state.trace_uuid, sizeof(trace_state.trace_uuid));
+
+	/* Store parallel worker info */
+	trace_state.is_parallel_worker = true;
+	trace_state.leader_pid = leader_pid;
+	trace_state.worker_id = worker_id;
+	strlcpy(trace_state.leader_trace_uuid, leader_uuid,
+			sizeof(trace_state.leader_trace_uuid));
+
+	/* Store start time in nanoseconds */
+	trace_state.start_time_ns = (uint64) ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+	/* File naming: pg_10046_<trace_id>.trc */
+	snprintf(trace_state.trace_path, MAXPGPATH,
+			 "%s/pg_10046_%s.trc",
+			 pg10046_trace_dir ? pg10046_trace_dir : "/tmp",
+			 trace_state.trace_id);
+
+	/*
+	 * LAZY FILE CREATION: Don't open file here.
+	 * Background worker will create file on first write.
+	 */
+	trace_state.trace_fd = -1;  /* No file yet - worker creates it */
+	trace_state.active = true;
+	trace_state.query_id = 0;
+	trace_state.call_stack_depth = 0;
+
+	/* Register exit callback lazily */
+	if (!exit_callback_registered)
 	{
-		ssize_t ret pg_attribute_unused();
-		len = Min(len, (int)sizeof(buf) - 1);
-		ret = write(trace_state.trace_fd, buf, len);
+		on_proc_exit(pg10046_on_proc_exit, 0);
+		exit_callback_registered = true;
 	}
+
+	/* Register with ring buffer - worker will use this info for header */
+	my_backend_slot = register_traced_backend();
+
+	elog(LOG, "pg_10046: parallel worker %d trace enabled (leader PID %d)",
+		 worker_id, leader_pid);
 }
 
 /*
@@ -2280,7 +2483,7 @@ write_trace(const char *fmt, ...)
 	char		buf[8192];
 	int			len;
 
-	if (trace_state.trace_fd <= 0)
+	if (!trace_state.active || my_backend_slot < 0)
 		return;
 
 	va_start(args, fmt);
@@ -2324,25 +2527,17 @@ write_trace(const char *fmt, ...)
 				local_trace_buf_pos += len;
 				return;
 			}
-			/* Event too large for buffer, fall through to direct write */
+			/* Event too large for buffer, write directly to ring buffer */
 		}
 
 		/*
-		 * Try ring buffer if available and worker is running.
+		 * Write to ring buffer.
+		 * With lazy file creation, ring buffer is required (no direct write fallback).
 		 */
 		if (ring_buffer_ctl != NULL &&
-			pg_atomic_read_u32(&ring_buffer_ctl->worker_running) &&
-			my_backend_slot >= 0)
+			pg_atomic_read_u32(&ring_buffer_ctl->worker_running))
 		{
-			if (ring_buffer_write(buf, len))
-				return;  /* Success - event written to ring buffer */
-			/* Fall through to direct write on failure */
-		}
-
-		/* Direct write (fallback) */
-		{
-			ssize_t ret pg_attribute_unused();
-			ret = write(trace_state.trace_fd, buf, len);
+			ring_buffer_write(buf, len);
 		}
 	}
 }
@@ -2359,7 +2554,7 @@ write_trace_nonblock(const char *fmt, ...)
 	char		buf[512];
 	int			len;
 
-	if (trace_state.trace_fd <= 0)
+	if (!trace_state.active || my_backend_slot < 0)
 		return;
 
 	va_start(args, fmt);
@@ -2371,22 +2566,15 @@ write_trace_nonblock(const char *fmt, ...)
 		len = Min(len, (int)sizeof(buf) - 1);
 
 		/*
-		 * Try ring buffer first - it's lock-free and safe for signal context.
+		 * Use ring buffer - it's lock-free and safe for signal context.
+		 * With lazy file creation, we always use ring buffer (no direct write).
 		 */
 		if (ring_buffer_ctl != NULL &&
-			pg_atomic_read_u32(&ring_buffer_ctl->worker_running) &&
-			my_backend_slot >= 0)
+			pg_atomic_read_u32(&ring_buffer_ctl->worker_running))
 		{
-			if (ring_buffer_write(buf, len))
-				return;
-			/* Fall through to direct write on failure */
+			ring_buffer_write(buf, len);
 		}
-
-		/* Non-blocking write - ignore errors */
-		{
-			ssize_t ret pg_attribute_unused();
-			ret = write(trace_state.trace_fd, buf, len);
-		}
+		/* Note: no fallback - ring buffer is required for lazy file creation */
 	}
 }
 
@@ -3443,6 +3631,45 @@ pg10046_planner(Query *parse, const char *query_string,
 static void
 pg10046_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+	/*
+	 * PARALLEL WORKER AUTO-ENABLE:
+	 * If this is a parallel worker and the leader has tracing enabled,
+	 * automatically enable tracing for this worker too.
+	 *
+	 * NOTE: We check if leader is traced regardless of pg10046_enabled GUC.
+	 * When tracing is enabled via enable_trace() cross-backend function,
+	 * the GUC may not be inherited by workers. We directly check the
+	 * traced backends registry instead.
+	 *
+	 * Getting leader PID:
+	 * - PG14+: ParallelLeaderPid global variable
+	 * - PG13 and earlier: MyBgworkerEntry->bgw_notify_pid (leader is notified)
+	 */
+	if (IsParallelWorker() && trace_state.trace_fd < 0)
+	{
+		char leader_uuid[40];
+		pid_t leader_pid;
+#if PG_VERSION_NUM >= 140000
+		leader_pid = ParallelLeaderPid;
+#else
+		/* In PG13, bgw_notify_pid is set to the leader's PID for parallel workers */
+		leader_pid = MyBgworkerEntry ? MyBgworkerEntry->bgw_notify_pid : 0;
+#endif
+
+		if (leader_pid > 0 && is_backend_traced(leader_pid, leader_uuid, sizeof(leader_uuid)))
+		{
+			/* Use PostgreSQL's ParallelWorkerNumber which is unique per worker */
+			int worker_id = ParallelWorkerNumber;
+
+			elog(DEBUG1, "pg_10046: enabling trace for parallel worker %d (leader PID %d)",
+				 worker_id, leader_pid);
+
+			/* Enable tracing for this worker */
+			pg10046_enabled = true;
+			open_worker_trace_file(leader_pid, leader_uuid, worker_id);
+		}
+	}
+
 	if (pg10046_enabled)
 	{
 		/*

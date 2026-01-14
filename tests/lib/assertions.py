@@ -468,3 +468,149 @@ def assert_basic_trace_correctness(path: str) -> TraceFile:
     assert_trace_complete_and_valid(trace)
 
     return trace
+
+
+# ============================================================================
+# Parallel Worker Assertions
+# ============================================================================
+
+def assert_is_parallel_worker_trace(trace: TraceFile):
+    """Assert trace is from a parallel worker (has worker-specific headers)."""
+    required_fields = ['LEADER_PID', 'LEADER_TRACE_UUID', 'WORKER_ID']
+    missing = [f for f in required_fields if f not in trace.header]
+
+    if missing:
+        raise TraceAssertionError(
+            "Not a parallel worker trace - missing required headers",
+            trace.path,
+            [f"Missing fields: {missing}", f"Present fields: {list(trace.header.keys())}"]
+        )
+
+
+def assert_is_leader_trace(trace: TraceFile):
+    """Assert trace is from a leader (not a parallel worker)."""
+    worker_fields = ['LEADER_PID', 'LEADER_TRACE_UUID', 'WORKER_ID']
+    present = [f for f in worker_fields if f in trace.header]
+
+    if present:
+        raise TraceAssertionError(
+            "Expected leader trace but found parallel worker trace",
+            trace.path,
+            [f"Worker fields present: {present}"]
+        )
+
+
+def assert_worker_trace_correlates_to_leader(worker_trace: TraceFile, leader_trace: TraceFile):
+    """Assert worker trace correctly correlates to leader trace."""
+    issues = []
+
+    # Check LEADER_PID matches leader's PID
+    worker_leader_pid = worker_trace.header.get('LEADER_PID')
+    leader_pid = leader_trace.header.get('PID')
+    if worker_leader_pid != leader_pid:
+        issues.append(f"LEADER_PID mismatch: worker has {worker_leader_pid}, leader PID is {leader_pid}")
+
+    # Check LEADER_TRACE_UUID matches leader's TRACE_UUID
+    worker_leader_uuid = worker_trace.header.get('LEADER_TRACE_UUID')
+    leader_uuid = leader_trace.header.get('TRACE_UUID')
+    if worker_leader_uuid != leader_uuid:
+        issues.append(f"LEADER_TRACE_UUID mismatch: worker has {worker_leader_uuid}, leader UUID is {leader_uuid}")
+
+    if issues:
+        raise TraceAssertionError(
+            "Worker trace does not correlate to leader trace",
+            worker_trace.path,
+            issues
+        )
+
+
+def assert_worker_ids_unique(worker_traces: List[TraceFile]):
+    """Assert all parallel workers have unique WORKER_IDs."""
+    seen_ids = {}
+    duplicates = []
+
+    for trace in worker_traces:
+        worker_id = trace.header.get('WORKER_ID')
+        if worker_id in seen_ids:
+            duplicates.append(f"WORKER_ID {worker_id} appears in {seen_ids[worker_id]} and {trace.path}")
+        else:
+            seen_ids[worker_id] = trace.path
+
+    if duplicates:
+        raise TraceAssertionError(
+            "Duplicate WORKER_IDs found",
+            None,
+            duplicates
+        )
+
+
+def get_total_tuples_from_traces(traces: List[TraceFile], node_type: str = None) -> int:
+    """Sum tuples from all traces (leader + workers).
+
+    Args:
+        traces: List of trace files to sum tuples from
+        node_type: Optional filter by node type (e.g., 'SeqScan')
+
+    Returns:
+        Total tuple count across all traces
+    """
+    total = 0
+
+    for trace in traces:
+        for query in trace.queries:
+            for stat in query.stats:
+                if node_type is None or stat.get('node_type', '').lower() == node_type.lower():
+                    total += stat.get('tuples', 0)
+
+    # Also check NODE_END events for tuples
+    for trace in traces:
+        for ptr, ends in trace.node_ends.items():
+            for end in ends:
+                end_node_type = end.data.get('node_type', '')
+                if node_type is None or end_node_type.lower() == node_type.lower():
+                    tuples = end.data.get('tuples', 0)
+                    if tuples > 0:
+                        total += tuples
+
+    return total
+
+
+def assert_parallel_tuples_complete(
+    leader_trace: TraceFile,
+    worker_traces: List[TraceFile],
+    expected_total: int,
+    tolerance: float = 0.01
+):
+    """Assert total tuples from leader + workers equals expected.
+
+    Args:
+        leader_trace: Leader's trace file
+        worker_traces: List of worker trace files
+        expected_total: Expected total tuple count
+        tolerance: Allowed deviation (default 1%)
+    """
+    all_traces = [leader_trace] + worker_traces
+
+    # Sum tuples from NODE_END events
+    total = 0
+    for trace in all_traces:
+        for ptr, ends in trace.node_ends.items():
+            for end in ends:
+                # Only count leaf nodes (SeqScan, IndexScan) to avoid double-counting
+                node_type = end.data.get('node_type', '')
+                if 'Scan' in node_type:
+                    total += end.data.get('tuples', 0)
+
+    min_expected = int(expected_total * (1 - tolerance))
+    max_expected = int(expected_total * (1 + tolerance))
+
+    if total < min_expected or total > max_expected:
+        raise TraceAssertionError(
+            f"Parallel tuple count mismatch",
+            leader_trace.path,
+            [
+                f"Expected: ~{expected_total} (tolerance {tolerance*100}%)",
+                f"Actual: {total}",
+                f"Traces analyzed: 1 leader + {len(worker_traces)} workers"
+            ]
+        )
