@@ -698,7 +698,7 @@ Note:
                         help="Database name for enabling extension trace (default: postgres)")
     parser.add_argument("--user", "-U", default="postgres",
                         help="Database user (default: postgres)")
-    parser.add_argument("--host", "-h", default=None,
+    parser.add_argument("--host", "-H", default=None,
                         help="Database host (default: local socket)")
     parser.add_argument("--port", "-p", default="5432",
                         help="Database port (default: 5432)")
