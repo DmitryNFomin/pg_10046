@@ -92,7 +92,114 @@ static int pg10046_ring_buffer_mb = 32;       /* Ring buffer size in MB (default
 static int pg10046_flush_interval_ms = 1000;  /* Flush interval in ms (default 1 second) */
 
 #define DEFAULT_DAEMON_SOCKET "/var/run/pg_10046.sock"
+#define DEFAULT_TRACE_DIR "/tmp"              /* Default trace directory */
 #define TRACE_SLOT_SIZE 4096                  /* Size of each trace slot in bytes (4KB) */
+
+/*
+ * GUC check hook for pg_10046.trace_dir
+ * Validates that the directory exists and is writable.
+ */
+static bool
+check_trace_dir(char **newval, void **extra, GucSource source)
+{
+	char	   *dir = *newval;
+	struct stat st;
+
+	/* NULL or empty is allowed - will use default */
+	if (dir == NULL || dir[0] == '\0')
+		return true;
+
+	/* Check if directory exists */
+	if (stat(dir, &st) != 0)
+	{
+		GUC_check_errdetail("Directory \"%s\" does not exist.", dir);
+		return false;
+	}
+
+	/* Check if it's actually a directory */
+	if (!S_ISDIR(st.st_mode))
+	{
+		GUC_check_errdetail("\"%s\" is not a directory.", dir);
+		return false;
+	}
+
+	/* Check if we can write to it */
+	if (access(dir, W_OK) != 0)
+	{
+		GUC_check_errdetail("Directory \"%s\" is not writable.", dir);
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * SQL-callable function to create the trace directory.
+ * Creates the directory with 0700 permissions if it doesn't exist.
+ * Returns true if directory exists or was created, false on error.
+ */
+PG_FUNCTION_INFO_V1(pg_10046_create_trace_dir);
+
+Datum
+pg_10046_create_trace_dir(PG_FUNCTION_ARGS)
+{
+	text	   *dir_text = PG_GETARG_TEXT_PP(0);
+	char	   *dir = text_to_cstring(dir_text);
+	struct stat st;
+
+	/* Check if directory already exists */
+	if (stat(dir, &st) == 0)
+	{
+		if (S_ISDIR(st.st_mode))
+		{
+			/* Directory exists, check if writable */
+			if (access(dir, W_OK) == 0)
+				PG_RETURN_BOOL(true);
+			else
+			{
+				ereport(WARNING,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("trace directory \"%s\" exists but is not writable", dir)));
+				PG_RETURN_BOOL(false);
+			}
+		}
+		else
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("\"%s\" exists but is not a directory", dir)));
+			PG_RETURN_BOOL(false);
+		}
+	}
+
+	/* Directory doesn't exist, try to create it */
+	if (mkdir(dir, 0700) == 0)
+	{
+		ereport(NOTICE,
+				(errmsg("created trace directory \"%s\"", dir)));
+		PG_RETURN_BOOL(true);
+	}
+	else
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not create trace directory \"%s\": %m", dir)));
+		PG_RETURN_BOOL(false);
+	}
+}
+
+/*
+ * SQL-callable function to get the current trace directory.
+ * Returns the effective trace directory path.
+ */
+PG_FUNCTION_INFO_V1(pg_10046_get_trace_dir);
+
+Datum
+pg_10046_get_trace_dir(PG_FUNCTION_ARGS)
+{
+	const char *dir = pg10046_trace_dir ? pg10046_trace_dir : DEFAULT_TRACE_DIR;
+	PG_RETURN_TEXT_P(cstring_to_text(dir));
+}
 #define TRACE_SLOT_DATA_SIZE (TRACE_SLOT_SIZE - 16)  /* Data area per slot */
 #define MAX_TRACED_BACKENDS 128               /* Max concurrent traced backends */
 
@@ -1930,12 +2037,13 @@ _PG_init(void)
 
 	DefineCustomStringVariable("pg_10046.trace_dir",
 							   "Directory for trace files",
-							   NULL,
+							   "Trace files will be written to this directory. "
+							   "Directory must exist and be writable. Default is /tmp.",
 							   &pg10046_trace_dir,
-							   "/tmp",
+							   DEFAULT_TRACE_DIR,
 							   PGC_USERSET,
 							   0,
-							   NULL, NULL, NULL);
+							   check_trace_dir, NULL, NULL);
 
 	DefineCustomIntVariable("pg_10046.sample_interval_ms",
 							"Sampling interval in milliseconds",
@@ -2342,7 +2450,7 @@ open_trace_file(void)
 	/* File naming: pg_10046_<trace_id>.trc */
 	snprintf(trace_state.trace_path, MAXPGPATH,
 			 "%s/pg_10046_%s.trc",
-			 pg10046_trace_dir ? pg10046_trace_dir : "/tmp",
+			 pg10046_trace_dir ? pg10046_trace_dir : DEFAULT_TRACE_DIR,
 			 trace_state.trace_id);
 
 	/*
@@ -2443,7 +2551,7 @@ open_worker_trace_file(int leader_pid, const char *leader_uuid, int worker_id)
 	/* File naming: pg_10046_<trace_id>.trc */
 	snprintf(trace_state.trace_path, MAXPGPATH,
 			 "%s/pg_10046_%s.trc",
-			 pg10046_trace_dir ? pg10046_trace_dir : "/tmp",
+			 pg10046_trace_dir ? pg10046_trace_dir : DEFAULT_TRACE_DIR,
 			 trace_state.trace_id);
 
 	/*

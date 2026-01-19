@@ -35,3 +35,22 @@ LANGUAGE C STRICT;
 
 COMMENT ON FUNCTION trace_10046.disable_trace(integer) IS
 'Clear pending trace request for another backend.';
+
+-- Create trace directory
+-- Use this to create a custom trace directory before setting pg_10046.trace_dir
+CREATE FUNCTION trace_10046.create_trace_dir(dir text)
+RETURNS boolean
+AS 'pg_10046', 'pg_10046_create_trace_dir'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION trace_10046.create_trace_dir(text) IS
+'Create trace directory if it does not exist. Returns true on success.';
+
+-- Get current trace directory
+CREATE FUNCTION trace_10046.get_trace_dir()
+RETURNS text
+AS 'pg_10046', 'pg_10046_get_trace_dir'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION trace_10046.get_trace_dir() IS
+'Returns the current trace directory path.';
