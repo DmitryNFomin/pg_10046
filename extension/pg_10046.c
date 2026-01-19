@@ -92,41 +92,71 @@ static int pg10046_ring_buffer_mb = 32;       /* Ring buffer size in MB (default
 static int pg10046_flush_interval_ms = 1000;  /* Flush interval in ms (default 1 second) */
 
 #define DEFAULT_DAEMON_SOCKET "/var/run/pg_10046.sock"
-#define DEFAULT_TRACE_DIR "/tmp"              /* Default trace directory */
+#define DEFAULT_TRACE_DIR "pg_10046_traces"   /* Default: $PGDATA/pg_10046_traces */
 #define TRACE_SLOT_SIZE 4096                  /* Size of each trace slot in bytes (4KB) */
+
+/*
+ * Resolve trace directory path.
+ * If path is relative (doesn't start with /), prepend DataDir.
+ * Returns pointer to static buffer - caller should copy if needed.
+ */
+static const char *
+resolve_trace_dir(const char *dir)
+{
+	static char resolved_path[MAXPGPATH];
+
+	if (dir == NULL || dir[0] == '\0')
+		dir = DEFAULT_TRACE_DIR;
+
+	/* Absolute path - use as-is */
+	if (dir[0] == '/')
+		return dir;
+
+	/* Relative path - prepend DataDir */
+	if (DataDir != NULL)
+		snprintf(resolved_path, MAXPGPATH, "%s/%s", DataDir, dir);
+	else
+		snprintf(resolved_path, MAXPGPATH, "%s", dir);  /* Fallback if DataDir not set */
+
+	return resolved_path;
+}
 
 /*
  * GUC check hook for pg_10046.trace_dir
  * Validates that the directory exists and is writable.
+ * Supports both absolute paths (/path) and relative paths (relative to $PGDATA).
  */
 static bool
 check_trace_dir(char **newval, void **extra, GucSource source)
 {
-	char	   *dir = *newval;
+	const char *resolved;
 	struct stat st;
 
 	/* NULL or empty is allowed - will use default */
-	if (dir == NULL || dir[0] == '\0')
+	if (*newval == NULL || (*newval)[0] == '\0')
 		return true;
 
+	/* Resolve relative path to absolute */
+	resolved = resolve_trace_dir(*newval);
+
 	/* Check if directory exists */
-	if (stat(dir, &st) != 0)
+	if (stat(resolved, &st) != 0)
 	{
-		GUC_check_errdetail("Directory \"%s\" does not exist.", dir);
+		GUC_check_errdetail("Directory \"%s\" does not exist.", resolved);
 		return false;
 	}
 
 	/* Check if it's actually a directory */
 	if (!S_ISDIR(st.st_mode))
 	{
-		GUC_check_errdetail("\"%s\" is not a directory.", dir);
+		GUC_check_errdetail("\"%s\" is not a directory.", resolved);
 		return false;
 	}
 
 	/* Check if we can write to it */
-	if (access(dir, W_OK) != 0)
+	if (access(resolved, W_OK) != 0)
 	{
-		GUC_check_errdetail("Directory \"%s\" is not writable.", dir);
+		GUC_check_errdetail("Directory \"%s\" is not writable.", resolved);
 		return false;
 	}
 
@@ -136,6 +166,7 @@ check_trace_dir(char **newval, void **extra, GucSource source)
 /*
  * SQL-callable function to create the trace directory.
  * Creates the directory with 0700 permissions if it doesn't exist.
+ * Supports relative paths (relative to $PGDATA) and absolute paths.
  * Returns true if directory exists or was created, false on error.
  */
 PG_FUNCTION_INFO_V1(pg_10046_create_trace_dir);
@@ -144,8 +175,15 @@ Datum
 pg_10046_create_trace_dir(PG_FUNCTION_ARGS)
 {
 	text	   *dir_text = PG_GETARG_TEXT_PP(0);
-	char	   *dir = text_to_cstring(dir_text);
+	char	   *input_dir = text_to_cstring(dir_text);
+	const char *dir;
+	char        resolved_copy[MAXPGPATH];
 	struct stat st;
+
+	/* Resolve relative path to absolute */
+	dir = resolve_trace_dir(input_dir);
+	strlcpy(resolved_copy, dir, MAXPGPATH);  /* Copy since resolve uses static buffer */
+	dir = resolved_copy;
 
 	/* Check if directory already exists */
 	if (stat(dir, &st) == 0)
@@ -190,15 +228,16 @@ pg_10046_create_trace_dir(PG_FUNCTION_ARGS)
 
 /*
  * SQL-callable function to get the current trace directory.
- * Returns the effective trace directory path.
+ * Returns the resolved (absolute) trace directory path.
  */
 PG_FUNCTION_INFO_V1(pg_10046_get_trace_dir);
 
 Datum
 pg_10046_get_trace_dir(PG_FUNCTION_ARGS)
 {
-	const char *dir = pg10046_trace_dir ? pg10046_trace_dir : DEFAULT_TRACE_DIR;
-	PG_RETURN_TEXT_P(cstring_to_text(dir));
+	const char *dir = resolve_trace_dir(pg10046_trace_dir);
+	const char *resolved = resolve_trace_dir(dir);
+	PG_RETURN_TEXT_P(cstring_to_text(resolved));
 }
 #define TRACE_SLOT_DATA_SIZE (TRACE_SLOT_SIZE - 16)  /* Data area per slot */
 #define MAX_TRACED_BACKENDS 128               /* Max concurrent traced backends */
@@ -2038,7 +2077,9 @@ _PG_init(void)
 	DefineCustomStringVariable("pg_10046.trace_dir",
 							   "Directory for trace files",
 							   "Trace files will be written to this directory. "
-							   "Directory must exist and be writable. Default is /tmp.",
+							   "Relative paths are relative to $PGDATA. "
+							   "Directory must exist and be writable. "
+							   "Default is pg_10046_traces (i.e., $PGDATA/pg_10046_traces).",
 							   &pg10046_trace_dir,
 							   DEFAULT_TRACE_DIR,
 							   PGC_USERSET,
@@ -2450,7 +2491,7 @@ open_trace_file(void)
 	/* File naming: pg_10046_<trace_id>.trc */
 	snprintf(trace_state.trace_path, MAXPGPATH,
 			 "%s/pg_10046_%s.trc",
-			 pg10046_trace_dir ? pg10046_trace_dir : DEFAULT_TRACE_DIR,
+			 resolve_trace_dir(pg10046_trace_dir),
 			 trace_state.trace_id);
 
 	/*
@@ -2551,7 +2592,7 @@ open_worker_trace_file(int leader_pid, const char *leader_uuid, int worker_id)
 	/* File naming: pg_10046_<trace_id>.trc */
 	snprintf(trace_state.trace_path, MAXPGPATH,
 			 "%s/pg_10046_%s.trc",
-			 pg10046_trace_dir ? pg10046_trace_dir : DEFAULT_TRACE_DIR,
+			 resolve_trace_dir(pg10046_trace_dir),
 			 trace_state.trace_id);
 
 	/*

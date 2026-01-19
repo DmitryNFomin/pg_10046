@@ -318,12 +318,31 @@ class PgHarness:
     def __init__(self, config: PgConfig = None):
         self.config = config or PgConfig.from_env()
         self._connections: List[PgConnection] = []
+        self._trace_dir_resolved = False
+
+    def _resolve_trace_dir(self, conn: PgConnection):
+        """Resolve trace_dir from PostgreSQL if not already done."""
+        if self._trace_dir_resolved:
+            return
+
+        # Query the actual trace directory from PostgreSQL
+        try:
+            result = conn.execute("SELECT trace_10046.get_trace_dir() AS dir")
+            if not result.error and result.rows:
+                self.config.trace_dir = result.rows[0]['dir']
+                self._trace_dir_resolved = True
+        except Exception:
+            # If extension not loaded, keep default
+            pass
 
     def new_connection(self) -> PgConnection:
         """Create a new PostgreSQL connection."""
         conn = PgConnection(self.config)
         conn.connect()
         self._connections.append(conn)
+
+        # Resolve trace_dir on first connection
+        self._resolve_trace_dir(conn)
         return conn
 
     def cleanup(self):
