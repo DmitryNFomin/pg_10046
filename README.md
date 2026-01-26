@@ -17,49 +17,48 @@ Real-time SQL tracing for PostgreSQL inspired by Oracle's event 10046 trace. Cap
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         PostgreSQL Backend                               │
+│                           PostgreSQL Backend                            │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  Planner Hook          Executor Hooks           Timeout Handler          │
-│      │                      │                        │                   │
-│      ▼                      ▼                        ▼                   │
-│  SQL/Binds/Plan     NODE_START/END            SAMPLE events              │
-│                                                                          │
-└──────────────────────────────┬───────────────────────────────────────────┘
-                               │
-                               ▼
+│      Planner Hook           Executor Hooks         Timeout Handler      │
+│           │                       │                      │              │
+│           ▼                       ▼                      ▼              │
+│      SQL/Binds/Plan         NODE_START/END          SAMPLE events       │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    Shared Memory Ring Buffer (32MB)                      │
-│                                                                          │
+│                    Shared Memory Ring Buffer (32MB)                     │
+│                                                                         │
 │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐        Lock-free atomic ops    │
 │  │Slot │ │Slot │ │Slot │ │Slot │ │Slot │ ...    65,536 slots            │
-│  └─────┘ └─────┘ └─────┘ └─────┘ └─────┘                                 │
-└──────────────────────────────┬───────────────────────────────────────────┘
-                               │
-                               ▼
+│  └─────┘ └─────┘ └─────┘ └─────┘ └─────┘                                │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│              Background Worker: pg_10046 trace writer                    │
-│                                                                          │
-│  • Reads events from ring buffer                                         │
-│  • Maintains file descriptor cache per backend                           │
-│  • Batched writes at configurable interval (default 1s)                  │
-│  • Minimal impact on query latency                                       │
-└──────────────────────────────┬───────────────────────────────────────────┘
-                               │
-                               ▼
+│                Background Worker: pg_10046 trace writer                 │
+│                                                                         │
+│  • Reads events from ring buffer                                        │
+│  • Maintains file descriptor cache per backend                          │
+│  • Batched writes at configurable interval (default 1s)                 │
+│  • Minimal impact on query latency                                      │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    Trace Files: /tmp/pg_10046_<pid>_<ts>.trc             │
+│                Trace Files: /tmp/pg_10046_<pid>_<ts>.trc                │
 └─────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                     Optional: eBPF Daemon (pg_10046d)                    │
+│                    Optional: eBPF Daemon (pg_10046d)                    │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  Global bpftrace probes:                                                 │
-│  • mdread/mdwrite     - Block IO with timing                             │
-│  • block:block_rq_*   - Distinguish disk vs OS cache                     │
-│  • sched:sched_switch - CPU scheduling (on/off CPU)                      │
-│  • ReadBufferExtended - Buffer request attribution                       │
-│                                                                          │
-│  Output: /tmp/pg_10046_ebpf_<pid>_<ts>.trc                               │
+│  Global bpftrace probes:                                                │
+│  • mdread/mdwrite     - Block IO with timing                            │
+│  • block:block_rq_*   - Distinguish disk vs OS cache                    │
+│  • sched:sched_switch - CPU scheduling (on/off CPU)                     │
+│  • ReadBufferExtended - Buffer request attribution                      │
+│                                                                         │
+│  Output: /tmp/pg_10046_ebpf_<pid>_<ts>.trc                              │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
